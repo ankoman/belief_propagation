@@ -3,11 +3,15 @@
 pub mod macros;
 pub mod bperror;
 pub mod bpgraph;
+pub mod ml_dsa_bp;
 pub mod msg;
 pub mod node;
 pub mod node_function;
+pub mod pymodule;
 pub mod types;
 pub mod variable_node;
+
+pub use pymodule::belief_propagation as python_module;
 
 pub use bperror::{BPError, BPResult};
 pub use bpgraph::{BPGraph, NodeIndex};

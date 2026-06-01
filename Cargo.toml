@@ -2,13 +2,17 @@
 name = "belief_propagation"
 version = "0.1.0"
 authors = ["Julius Hermelink <julius.hermelink@unibw.de>"]
-edition = "2018"
+edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "belief_propagation"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 crossbeam = "0.8.0"
 itertools = "0.10.0"
+rayon = "=1.10.0"
+pyo3 = { version = "0.22", features = ["extension-module"] }
 
 [features]
 debug_output = []
