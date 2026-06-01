@@ -10,8 +10,7 @@ Given enough traces the attacker recovers the secret-key polynomial s.
 
 Two configurations are shown:
   - Demo (n=32):  fast, finishes in a few seconds.
-  - ML-DSA-44 (n=256, tau=39): realistic parameters; feasible with tight sigma
-    because the adaptive prior reduces inner-loop work to O(sigma^2) per cell.
+  - ML-DSA-44 (n=256, tau=39): realistic parameters.
 """
 
 import math
@@ -64,21 +63,13 @@ def gaussian_prior(
     sigma: float,
     x_min: int,
     x_max: int,
-    radius: int,
 ) -> Dict[int, float]:
-    """
-    Gaussian prior centred on `measured`, clipped to [x_min, x_max].
-    Only values within `radius` of round(measured) are included so the
-    support stays small even when the theoretical range is large.
-    """
-    center = int(round(measured))
-    lo = max(x_min, center - radius)
-    hi = min(x_max, center + radius)
+    """Gaussian prior over the full support [x_min, x_max]."""
     raw = {v: math.exp(-((measured - v) ** 2) / (2 * sigma ** 2))
-           for v in range(lo, hi + 1)}
+           for v in range(x_min, x_max + 1)}
     total = sum(raw.values())
     if total == 0:
-        return {center: 1.0}
+        return {(x_min + x_max) // 2: 1.0}
     return {v: p / total for v, p in raw.items()}
 
 
@@ -103,9 +94,6 @@ def run_attack(
 
     x_min = -tau * eta
     x_max =  tau * eta
-    # Radius keeps the support small: capture ~6σ so virtually no probability
-    # mass is truncated.
-    radius = max(1, int(math.ceil(3 * sigma)))
 
     t0 = time.perf_counter()
     for t in range(num_traces):
@@ -113,7 +101,7 @@ def run_attack(
         x_true    = poly_mul_mod(challenge, secret)
 
         x_priors = [
-            gaussian_prior(xi + rng.gauss(0, sigma), sigma, x_min, x_max, radius)
+            gaussian_prior(xi + rng.gauss(0, sigma), sigma, x_min, x_max)
             for xi in x_true
         ]
 
@@ -139,8 +127,8 @@ def run_attack(
 if __name__ == "__main__":
     configs = [
         # (label,           n,   eta, tau, traces, sigma, report_every)
-        ("Demo n=32",       32,  2,   5,   30,     0.5,   5),
-        ("ML-DSA-44 n=256", 256, 2,   39,  20,     0.5,   5),
+        #("Demo n=32",       32,  2,   5,   30,     0.5,   5),
+        ("ML-DSA-44 n=256", 256, 2,   39,  20,     50,   5),
     ]
 
     for label, n, eta, tau, num_traces, sigma, every in configs:
