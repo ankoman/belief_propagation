@@ -175,9 +175,11 @@ def run_attack(
         print(f"  iter={it}  correct={ok}/{n} ({100*ok/n:.1f}%)  recovered={rec}/{n}  [{elapsed:.1f}s]")
 
     est     = bp.get_map_estimate()
+    lp      = bp.get_log_probs()
     ok      = sum(e == s for e, s in zip(est, secret))
+    rec     = count_recovered(est, secret, lp)
     elapsed = time.perf_counter() - t0
-    return ok / n, elapsed
+    return ok, rec, n, elapsed
 
 
 # -----------------------------------------------------------------------
@@ -193,5 +195,5 @@ if __name__ == "__main__":
 
     for label, n, eta, tau, num_traces, snr, iters in configs:
         print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, snr={snr}) ===")
-        acc, elapsed = run_attack(n, eta, tau, num_traces, snr, num_iterations=iters)
-        print(f"  => final accuracy {100*acc:.1f}%  total {elapsed:.1f}s")
+        ok, rec, n_, elapsed = run_attack(n, eta, tau, num_traces, snr, num_iterations=iters)
+        print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")
