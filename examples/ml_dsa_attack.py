@@ -158,6 +158,8 @@ def run_attack(
 
     # Phase 2: add traces with noisy observations
     bp = MLDsaBP(n, eta)
+    p_unif = 1.0 / (2 * eta + 1)
+    bp.set_prior([{v: p_unif for v in range(-eta, eta + 1)} for _ in range(n)])
     for challenge, x_true in traces_raw:
         x_obs    = [xi + rng.gauss(0, sigma) for xi in x_true]
         x_priors = [observation_likelihood(obs, sigma, x_min, x_max) for obs in x_obs]

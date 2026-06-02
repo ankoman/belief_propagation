@@ -136,6 +136,7 @@ pub struct MLDsaBP {
     n: usize,
     eta: i32,
     traces: Vec<Trace>,
+    prior: Vec<Msg>,
     log_probs: Vec<Msg>,
 }
 
@@ -143,10 +144,32 @@ pub struct MLDsaBP {
 impl MLDsaBP {
     #[new]
     pub fn new(n: usize, eta: i32) -> Self {
-        let log_probs = (0..n)
+        let prior: Vec<Msg> = (0..n)
             .map(|_| (-eta..=eta).map(|s| (s, 0.0f64)).collect())
             .collect();
-        MLDsaBP { n, eta, traces: Vec::new(), log_probs }
+        let log_probs = prior.clone();
+        MLDsaBP { n, eta, traces: Vec::new(), prior, log_probs }
+    }
+
+    /// Set the prior distribution for each secret key coefficient.
+    ///
+    /// `prior` is a list of n dicts mapping value → probability (not log-prob).
+    /// Resets log_probs to the new prior.
+    pub fn set_prior(&mut self, prior: Vec<HashMap<i32, f64>>) -> PyResult<()> {
+        if prior.len() != self.n {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "prior must have length n",
+            ));
+        }
+        for (j, prob_map) in prior.iter().enumerate() {
+            for (&v, &p) in prob_map {
+                if let Some(lp) = self.prior[j].get_mut(&v) {
+                    *lp = if p > 0.0 { p.ln() } else { -1e300_f64 };
+                }
+            }
+        }
+        self.log_probs = self.prior.clone();
+        Ok(())
     }
 
     /// Store a trace (challenge + measurement priors). Does not compute anything.
@@ -177,9 +200,7 @@ impl MLDsaBP {
         let n_vals = (2 * self.eta + 1) as usize;
         let beliefs = beliefs_from_log_probs(&self.log_probs, n_vals);
 
-        let mut new_log_probs: Vec<Msg> = (0..self.n)
-            .map(|_| (-self.eta..=self.eta).map(|s| (s, 0.0f64)).collect())
-            .collect();
+        let mut new_log_probs: Vec<Msg> = self.prior.clone();
 
         for trace in &self.traces {
             let contribs = compute_contributions(trace, &beliefs, self.n, self.eta);
@@ -224,14 +245,10 @@ impl MLDsaBP {
         self.log_probs.clone()
     }
 
-    /// Reset log_probs and discard all stored traces.
+    /// Reset log_probs to prior and discard all stored traces.
     pub fn reset(&mut self) {
         self.traces.clear();
-        for lp in &mut self.log_probs {
-            for v in lp.values_mut() {
-                *v = 0.0;
-            }
-        }
+        self.log_probs = self.prior.clone();
     }
 
     pub fn trace_count(&self) -> usize {
