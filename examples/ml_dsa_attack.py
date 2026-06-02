@@ -83,8 +83,8 @@ def run_attack(
     tau: int,
     num_traces: int,
     sigma: float,
+    num_iterations: int = 5,
     seed: int = 42,
-    report_every: int = 10,
 ) -> Tuple[float, float]:
     """Run the SASCA and return (accuracy, elapsed_seconds)."""
     rng = random.Random(seed)
@@ -96,23 +96,25 @@ def run_attack(
     x_max =  tau * eta
 
     t0 = time.perf_counter()
-    for t in range(num_traces):
+
+    # Phase 1: collect all traces
+    for _ in range(num_traces):
         challenge = random_challenge(n, tau, rng)
         x_true    = poly_mul_mod(challenge, secret)
-
-        x_priors = [
+        x_priors  = [
             gaussian_prior(xi + rng.gauss(0, sigma), sigma, x_min, x_max)
             for xi in x_true
         ]
-
         bp.add_trace(challenge, x_priors)
+    print(f"  collected {bp.trace_count()} traces  [{time.perf_counter()-t0:.1f}s]")
 
-        if (t + 1) % report_every == 0:
-            est = bp.get_map_estimate()
-            ok  = sum(e == s for e, s in zip(est, secret))
-            elapsed = time.perf_counter() - t0
-            print(f"    traces={t+1:4d}  correct={ok}/{n} ({100*ok/n:.1f}%)"
-                  f"  [{elapsed:.1f}s]")
+    # Phase 2: iterate BP
+    for it in range(1, num_iterations + 1):
+        bp.run_iteration()
+        est = bp.get_map_estimate()
+        ok  = sum(e == s for e, s in zip(est, secret))
+        elapsed = time.perf_counter() - t0
+        print(f"  iter={it}  correct={ok}/{n} ({100*ok/n:.1f}%)  [{elapsed:.1f}s]")
 
     est     = bp.get_map_estimate()
     ok      = sum(e == s for e, s in zip(est, secret))
@@ -126,12 +128,12 @@ def run_attack(
 
 if __name__ == "__main__":
     configs = [
-        # (label,           n,   eta, tau, traces, sigma, report_every)
-        #("Demo n=32",       32,  2,   5,   30,     0.5,   5),
-        ("ML-DSA-44 n=256", 256, 2,   39,  20,     50,   5),
+        # (label,           n,   eta, tau, traces, sigma, iters)
+        ("Demo n=32",       32,  2,   5,   20,     0.5,   5),
+        ("ML-DSA-44 n=256", 256, 2,   39,  20,     0.5,   5),
     ]
 
-    for label, n, eta, tau, num_traces, sigma, every in configs:
+    for label, n, eta, tau, num_traces, sigma, iters in configs:
         print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, sigma={sigma}) ===")
-        acc, elapsed = run_attack(n, eta, tau, num_traces, sigma, report_every=every)
+        acc, elapsed = run_attack(n, eta, tau, num_traces, sigma, num_iterations=iters)
         print(f"  => final accuracy {100*acc:.1f}%  total {elapsed:.1f}s")
