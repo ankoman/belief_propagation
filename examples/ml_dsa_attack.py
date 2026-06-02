@@ -108,13 +108,17 @@ def count_recovered(
 
 
 def observation_likelihood(
-    x_obs: float,
+    l_obs: float,
     sigma: float,
     x_min: int,
     x_max: int,
 ) -> Dict[int, float]:
-    """P(x_obs | model_v) for each v in [x_min, x_max], where model_v ~ N(v, sigma^2)."""
-    raw = {v: math.exp(-((x_obs - v) ** 2) / (2 * sigma ** 2))
+    """P(l_obs | x=v) for each v in [x_min, x_max].
+
+    Leakage model (paper Eq. 12-14): l_obs = HW32(x) + N(0, sigma^2).
+    Template: exp(-(l_obs - HW32(v))^2 / (2*sigma^2)).
+    """
+    raw = {v: math.exp(-((l_obs - hamming_weight_32(v)) ** 2) / (2 * sigma ** 2))
            for v in range(x_min, x_max + 1)}
     total = sum(raw.values())
     if total == 0:
@@ -136,6 +140,11 @@ def run_attack(
     seed: int = 10,
 ) -> Tuple[float, float]:
     """Run the SASCA and return (accuracy, elapsed_seconds)."""
+    # Derive sigma from SNR using theoretical HW32 variance
+    var_hw = var_hw32_theoretical(tau, eta)
+    sigma  = math.sqrt(var_hw / snr)
+    print(f"  HW32 var(theoretical)={var_hw:.2f}  sigma={sigma:.4f}")
+    
     rng = random.Random(seed)
     secret = random_secret(n, eta, rng)
 
@@ -151,17 +160,12 @@ def run_attack(
         x_true    = poly_mul_mod(challenge, secret)
         traces_raw.append((challenge, x_true))
 
-    # Derive sigma from SNR using theoretical HW32 variance
-    var_hw = var_hw32_theoretical(tau, eta)
-    sigma  = math.sqrt(var_hw / snr)
-    print(f"  HW32 var(theoretical)={var_hw:.2f}  sigma={sigma:.4f}")
-
     # Phase 2: add traces with noisy observations
     bp = MLDsaBP(n, eta)
     p_unif = 1.0 / (2 * eta + 1)
     bp.set_prior([{v: p_unif for v in range(-eta, eta + 1)} for _ in range(n)])
     for challenge, x_true in traces_raw:
-        x_obs    = [xi + rng.gauss(0, sigma) for xi in x_true]
+        x_obs    = [hamming_weight_32(xi) + rng.gauss(0, sigma) for xi in x_true]
         x_priors = [observation_likelihood(obs, sigma, x_min, x_max) for obs in x_obs]
         bp.add_trace(challenge, x_priors)
     print(f"  collected {bp.trace_count()} traces  [{time.perf_counter()-t0:.1f}s]")
@@ -192,7 +196,7 @@ if __name__ == "__main__":
     configs = [
         # (label,           n,   eta, tau, traces, snr,  iters)
         # ("Demo n=32",       32,  2,   5,   20,     10.0, 5),
-        ("ML-DSA-44 n=256", 256, 2,   39,  6,     10.0, 20),
+        ("ML-DSA-44 n=256", 256, 2,   39,  300,     0.01, 20),
     ]
 
     for label, n, eta, tau, num_traces, snr, iters in configs:
