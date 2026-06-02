@@ -58,6 +58,28 @@ def poly_mul_mod(c: List[int], s: List[int]) -> List[int]:
     return x
 
 
+def hamming_weight_32(v: int) -> int:
+    """Number of 1-bits in the 32-bit two's complement representation."""
+    return bin(v & 0xFFFFFFFF).count('1')
+
+
+def var_hw32_theoretical(tau: int, eta: int) -> float:
+    """Theoretical Var(HW32(x_true[i])) for x_true[i] = sum of tau i.i.d. Uniform{-eta..eta}."""
+    # Exact distribution by convolution
+    dist: Dict[int, float] = {0: 1.0}
+    p_single = 1.0 / (2 * eta + 1)
+    for _ in range(tau):
+        new: Dict[int, float] = {}
+        for v1, p1 in dist.items():
+            for dv in range(-eta, eta + 1):
+                key = v1 + dv
+                new[key] = new.get(key, 0.0) + p1 * p_single
+        dist = new
+    e1 = sum(p * hamming_weight_32(v) for v, p in dist.items())
+    e2 = sum(p * hamming_weight_32(v) ** 2 for v, p in dist.items())
+    return e2 - e1 ** 2
+
+
 def _entropy(log_prob: Dict[int, float]) -> float:
     """Shannon entropy of a belief given as {value: log_prob}."""
     vals = list(log_prob.values())
@@ -85,14 +107,14 @@ def count_recovered(
     return count
 
 
-def gaussian_prior(
-    measured: float,
+def observation_likelihood(
+    x_obs: float,
     sigma: float,
     x_min: int,
     x_max: int,
 ) -> Dict[int, float]:
-    """Gaussian prior over the full support [x_min, x_max]."""
-    raw = {v: math.exp(-((measured - v) ** 2) / (2 * sigma ** 2))
+    """P(x_obs | model_v) for each v in [x_min, x_max], where model_v ~ N(v, sigma^2)."""
+    raw = {v: math.exp(-((x_obs - v) ** 2) / (2 * sigma ** 2))
            for v in range(x_min, x_max + 1)}
     total = sum(raw.values())
     if total == 0:
@@ -109,29 +131,36 @@ def run_attack(
     eta: int,
     tau: int,
     num_traces: int,
-    sigma: float,
+    snr: float,
     num_iterations: int = 5,
-    seed: int = 42,
+    seed: int = 10,
 ) -> Tuple[float, float]:
     """Run the SASCA and return (accuracy, elapsed_seconds)."""
     rng = random.Random(seed)
     secret = random_secret(n, eta, rng)
-
-    bp = MLDsaBP(n, eta)
 
     x_min = -tau * eta
     x_max =  tau * eta
 
     t0 = time.perf_counter()
 
-    # Phase 1: collect all traces
+    # Phase 1: generate all (challenge, x_true) pairs
+    traces_raw = []
     for _ in range(num_traces):
         challenge = random_challenge(n, tau, rng)
         x_true    = poly_mul_mod(challenge, secret)
-        x_priors  = [
-            gaussian_prior(xi + rng.gauss(0, sigma), sigma, x_min, x_max)
-            for xi in x_true
-        ]
+        traces_raw.append((challenge, x_true))
+
+    # Derive sigma from SNR using theoretical HW32 variance
+    var_hw = var_hw32_theoretical(tau, eta)
+    sigma  = math.sqrt(var_hw / snr)
+    print(f"  HW32 var(theoretical)={var_hw:.2f}  sigma={sigma:.4f}")
+
+    # Phase 2: add traces with noisy observations
+    bp = MLDsaBP(n, eta)
+    for challenge, x_true in traces_raw:
+        x_obs    = [xi + rng.gauss(0, sigma) for xi in x_true]
+        x_priors = [observation_likelihood(obs, sigma, x_min, x_max) for obs in x_obs]
         bp.add_trace(challenge, x_priors)
     print(f"  collected {bp.trace_count()} traces  [{time.perf_counter()-t0:.1f}s]")
 
@@ -157,12 +186,12 @@ def run_attack(
 
 if __name__ == "__main__":
     configs = [
-        # (label,           n,   eta, tau, traces, sigma, iters)
-        # ("Demo n=32",       32,  2,   5,   20,     0.5,   5),
-        ("ML-DSA-44 n=256", 256, 2,   39,  20,     0.5,   5),
+        # (label,           n,   eta, tau, traces, snr,  iters)
+        # ("Demo n=32",       32,  2,   5,   20,     10.0, 5),
+        ("ML-DSA-44 n=256", 256, 2,   39,  6,     10.0, 20),
     ]
 
-    for label, n, eta, tau, num_traces, sigma, iters in configs:
-        print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, sigma={sigma}) ===")
-        acc, elapsed = run_attack(n, eta, tau, num_traces, sigma, num_iterations=iters)
+    for label, n, eta, tau, num_traces, snr, iters in configs:
+        print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, snr={snr}) ===")
+        acc, elapsed = run_attack(n, eta, tau, num_traces, snr, num_iterations=iters)
         print(f"  => final accuracy {100*acc:.1f}%  total {elapsed:.1f}s")
