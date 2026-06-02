@@ -58,6 +58,33 @@ def poly_mul_mod(c: List[int], s: List[int]) -> List[int]:
     return x
 
 
+def _entropy(log_prob: Dict[int, float]) -> float:
+    """Shannon entropy of a belief given as {value: log_prob}."""
+    vals = list(log_prob.values())
+    max_v = max(vals)
+    exp_v = [math.exp(v - max_v) for v in vals]
+    total = sum(exp_v)
+    probs = [e / total for e in exp_v]
+    return -sum(p * math.log(p) for p in probs if p > 0.0)
+
+
+def count_recovered(
+    est: List[int],
+    secret: List[int],
+    log_probs: List[Dict[int, float]],
+) -> int:
+    """Largest K s.t. top-K most confident (lowest entropy) MAP estimates are all correct."""
+    entropies = [_entropy(lp) for lp in log_probs]
+    order = sorted(range(len(entropies)), key=lambda i: entropies[i])
+    count = 0
+    for idx in order:
+        if est[idx] == secret[idx]:
+            count += 1
+        else:
+            break
+    return count
+
+
 def gaussian_prior(
     measured: float,
     sigma: float,
@@ -111,10 +138,12 @@ def run_attack(
     # Phase 2: iterate BP
     for it in range(1, num_iterations + 1):
         bp.run_iteration()
-        est = bp.get_map_estimate()
-        ok  = sum(e == s for e, s in zip(est, secret))
-        elapsed = time.perf_counter() - t0
-        print(f"  iter={it}  correct={ok}/{n} ({100*ok/n:.1f}%)  [{elapsed:.1f}s]")
+        est      = bp.get_map_estimate()
+        lp       = bp.get_log_probs()
+        ok       = sum(e == s for e, s in zip(est, secret))
+        rec      = count_recovered(est, secret, lp)
+        elapsed  = time.perf_counter() - t0
+        print(f"  iter={it}  correct={ok}/{n} ({100*ok/n:.1f}%)  recovered={rec}/{n}  [{elapsed:.1f}s]")
 
     est     = bp.get_map_estimate()
     ok      = sum(e == s for e, s in zip(est, secret))
@@ -129,7 +158,7 @@ def run_attack(
 if __name__ == "__main__":
     configs = [
         # (label,           n,   eta, tau, traces, sigma, iters)
-        ("Demo n=32",       32,  2,   5,   20,     0.5,   5),
+        # ("Demo n=32",       32,  2,   5,   20,     0.5,   5),
         ("ML-DSA-44 n=256", 256, 2,   39,  20,     0.5,   5),
     ]
 
