@@ -174,14 +174,14 @@ def run_attack(
     for it in range(1, num_iterations + 1):
         bp.run_iteration()
         est      = bp.get_map_estimate()
-        lp       = bp.get_log_probs()
+        lp       = bp.get_log_key_probs()
         ok       = sum(e == s for e, s in zip(est, secret))
         rec      = count_recovered(est, secret, lp)
         elapsed  = time.perf_counter() - t0
         print(f"  iter={it}  correct={ok}/{n} ({100*ok/n:.1f}%)  recovered={rec}/{n}  [{elapsed:.1f}s]")
 
     est     = bp.get_map_estimate()
-    lp      = bp.get_log_probs()
+    lp      = bp.get_log_key_probs()
     ok      = sum(e == s for e, s in zip(est, secret))
     rec     = count_recovered(est, secret, lp)
     elapsed = time.perf_counter() - t0
@@ -196,7 +196,7 @@ if __name__ == "__main__":
     configs = [
         # (label,           n,   eta, tau, traces, snr,  iters)
         # ("Demo n=32",       32,  2,   5,   20,     10.0, 5),
-        ("ML-DSA-44 n=256", 256, 2,   39,  300,     0.01, 20),
+        ("ML-DSA-44 n=256", 256, 2,   39,  22,     0.1, 20),
     ]
 
     for label, n, eta, tau, num_traces, snr, iters in configs:

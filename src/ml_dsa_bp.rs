@@ -7,8 +7,8 @@ type FactorMsgs = Vec<Vec<(usize, Vec<(i32, f64)>)>>;
 
 fn convadd(g: &Msg, s_msg: &Msg, c: i32) -> Msg {
     let mut out = Msg::new();
-    for (&gv, &gp) in g {
-        for (&sv, &sp) in s_msg {
+    for (&sv, &sp) in s_msg {
+        for (&gv, &gp) in g {
             *out.entry(gv + c * sv).or_insert(0.0) += gp * sp;
         }
     }
@@ -47,14 +47,14 @@ struct Trace {
 // -----------------------------------------------------------------------
 
 // Cavity belief of variable j w.r.t. a specific factor:
-//   cavity_log[v] = log_probs_j[v] - prev_msg[v]
+//   cavity_log[v] = log_key_probs_j[v] - prev_msg[v]
 // then softmax-normalized. When prev_msg is None (first iteration), uses
-// log_probs_j directly (equivalent to full belief = uniform for zero prior).
-fn cavity_belief(log_probs_j: &Msg, prev_msg: Option<&[(i32, f64)]>, n_vals: usize) -> Msg {
+// log_key_probs_j directly (equivalent to full belief = uniform for zero prior).
+fn cavity_belief(log_key_probs_j: &Msg, prev_msg: Option<&[(i32, f64)]>, n_vals: usize) -> Msg {
     let cavity_log: Msg = match prev_msg {
         Some(prev) => {
             // prev is tiny (2*eta+1 entries), linear scan avoids HashMap allocation
-            log_probs_j
+            log_key_probs_j
                 .iter()
                 .map(|(&v, &lp)| {
                     let pm = prev.iter().find(|&&(k, _)| k == v).map_or(0.0, |&(_, p)| p);
@@ -62,7 +62,7 @@ fn cavity_belief(log_probs_j: &Msg, prev_msg: Option<&[(i32, f64)]>, n_vals: usi
                 })
                 .collect()
         }
-        None => log_probs_j.clone(),
+        None => log_key_probs_j.clone(),
     };
     let max_lp = cavity_log.values().cloned().fold(f64::NEG_INFINITY, f64::max);
     let raw: Msg = cavity_log.iter().map(|(&v, &l)| (v, (l - max_lp).exp())).collect();
@@ -70,16 +70,16 @@ fn cavity_belief(log_probs_j: &Msg, prev_msg: Option<&[(i32, f64)]>, n_vals: usi
     if sum > 0.0 {
         raw.into_iter().map(|(v, p)| (v, p / sum)).collect()
     } else {
-        log_probs_j.keys().map(|&v| (v, 1.0 / n_vals as f64)).collect()
+        log_key_probs_j.keys().map(|&v| (v, 1.0 / n_vals as f64)).collect()
     }
 }
 
 // For each output i, builds left[k] and right[k] using cavity beliefs
-// (log_probs minus this factor's previous message), then computes the
+// (log_key_probs minus this factor's previous message), then computes the
 // factor→variable message for each connected s[j].
 fn compute_contributions(
     trace: &Trace,
-    log_probs: &[Msg],
+    log_key_probs: &[Msg],
     prev_msgs: &FactorMsgs,
     n: usize,
     eta: i32,
@@ -105,7 +105,7 @@ fn compute_contributions(
                 .enumerate()
                 .map(|(k, &(j, _))| {
                     let prev = prev_msgs_i.get(k).map(|(_, msg)| msg.as_slice());
-                    cavity_belief(&log_probs[j], prev, n_vals)
+                    cavity_belief(&log_key_probs[j], prev, n_vals)
                 })
                 .collect();
 
@@ -165,7 +165,7 @@ pub struct MLDsaBP {
     eta: i32,
     traces: Vec<Trace>,
     prior: Vec<Msg>,
-    log_probs: Vec<Msg>,
+    log_key_probs: Vec<Msg>,
     prev_factor_msgs: Vec<FactorMsgs>,
 }
 
@@ -176,14 +176,14 @@ impl MLDsaBP {
         let prior: Vec<Msg> = (0..n)
             .map(|_| (-eta..=eta).map(|s| (s, 0.0f64)).collect())
             .collect();
-        let log_probs = prior.clone();
-        MLDsaBP { n, eta, traces: Vec::new(), prior, log_probs, prev_factor_msgs: Vec::new() }
+        let log_key_probs = prior.clone();
+        MLDsaBP { n, eta, traces: Vec::new(), prior, log_key_probs, prev_factor_msgs: Vec::new() }
     }
 
     /// Set the prior distribution for each secret key coefficient.
     ///
     /// `prior` is a list of n dicts mapping value → probability (not log-prob).
-    /// Resets log_probs to the new prior.
+    /// Resets log_key_probs to the new prior.
     pub fn set_prior(&mut self, prior: Vec<HashMap<i32, f64>>) -> PyResult<()> {
         if prior.len() != self.n {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -197,7 +197,7 @@ impl MLDsaBP {
                 }
             }
         }
-        self.log_probs = self.prior.clone();
+        self.log_key_probs = self.prior.clone();
         Ok(())
     }
 
@@ -219,28 +219,28 @@ impl MLDsaBP {
 
     /// Run one BP iteration.
     ///
-    /// Computes factor→variable messages using cavity beliefs (log_probs minus
+    /// Computes factor→variable messages using cavity beliefs (log_key_probs minus
     /// this factor's previous message) for each factor-variable pair, then
-    /// replaces log_probs with the freshly accumulated values.
+    /// replaces log_key_probs with the freshly accumulated values.
     pub fn run_iteration(&mut self) -> PyResult<()> {
-        let mut new_log_probs: Vec<Msg> = self.prior.clone();
+        let mut new_log_key_probs: Vec<Msg> = self.prior.clone();
         let mut new_factor_msgs: Vec<FactorMsgs> = Vec::with_capacity(self.traces.len());
 
         let empty: FactorMsgs = Vec::new();
         for (t, trace) in self.traces.iter().enumerate() {
             let prev = self.prev_factor_msgs.get(t).unwrap_or(&empty);
-            let contribs = compute_contributions(trace, &self.log_probs, prev, self.n, self.eta);
+            let contribs = compute_contributions(trace, &self.log_key_probs, prev, self.n, self.eta);
             for i_contribs in &contribs {
                 for (j, deltas) in i_contribs {
                     for (sv, delta) in deltas {
-                        *new_log_probs[*j].get_mut(sv).unwrap() += delta;
+                        *new_log_key_probs[*j].get_mut(sv).unwrap() += delta;
                     }
                 }
             }
             new_factor_msgs.push(contribs);
         }
 
-        self.log_probs = new_log_probs;
+        self.log_key_probs = new_log_key_probs;
         self.prev_factor_msgs = new_factor_msgs;
         Ok(())
     }
@@ -255,7 +255,7 @@ impl MLDsaBP {
 
     /// Return the MAP estimate of the secret key polynomial (n coefficients).
     pub fn get_map_estimate(&self) -> Vec<i32> {
-        self.log_probs
+        self.log_key_probs
             .iter()
             .map(|lp| {
                 lp.iter()
@@ -269,14 +269,14 @@ impl MLDsaBP {
     }
 
     /// Return accumulated log-probabilities for all secret key coefficients.
-    pub fn get_log_probs(&self) -> Vec<HashMap<i32, f64>> {
-        self.log_probs.clone()
+    pub fn get_log_key_probs(&self) -> Vec<HashMap<i32, f64>> {
+        self.log_key_probs.clone()
     }
 
-    /// Reset log_probs to prior and discard all stored traces.
+    /// Reset log_key_probs to prior and discard all stored traces.
     pub fn reset(&mut self) {
         self.traces.clear();
-        self.log_probs = self.prior.clone();
+        self.log_key_probs = self.prior.clone();
         self.prev_factor_msgs.clear();
     }
 
