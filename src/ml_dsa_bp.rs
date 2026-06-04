@@ -5,23 +5,9 @@ use std::collections::HashMap;
 type Msg = HashMap<i32, f64>;
 type FactorMsgs = Vec<Vec<(usize, Vec<(i32, f64)>)>>;
 
-fn convadd(g: &Msg, s_msg: &Msg, c: i32) -> Msg {
-    let mut out = Msg::new();
-    for (&sv, &sp) in s_msg {
-        for (&gv, &gp) in g {
-            *out.entry(gv + c * sv).or_insert(0.0) += gp * sp;
-        }
-    }
-    out
-}
-
 fn challenge_weight(c: &[i32], i: usize, j: usize) -> i32 {
     let n = c.len();
-    if j <= i {
-        c[i - j]
-    } else {
-        -c[n + i - j]
-    }
+    if j <= i { c[i - j] } else { -c[n + i - j] }
 }
 
 fn get_nonzero_for_output(c: &[i32], i: usize) -> Vec<(usize, i32)> {
@@ -31,6 +17,102 @@ fn get_nonzero_for_output(c: &[i32], i: usize) -> Vec<(usize, i32)> {
             if w != 0 { Some((j, w)) } else { None }
         })
         .collect()
+}
+
+// -----------------------------------------------------------------------
+// Dense distribution over a contiguous integer range
+// -----------------------------------------------------------------------
+
+#[derive(Clone)]
+struct DenseMsg {
+    offset: i32,    // key at data[0]
+    data: Vec<f64>, // data[v - offset] = probability at key v
+}
+
+impl DenseMsg {
+    fn delta(v: i32) -> Self {
+        DenseMsg { offset: v, data: vec![1.0] }
+    }
+
+    fn from_sparse(map: &HashMap<i32, f64>) -> Self {
+        if map.is_empty() {
+            return DenseMsg { offset: 0, data: vec![] };
+        }
+        let lo = *map.keys().min().unwrap();
+        let hi = *map.keys().max().unwrap();
+        let mut data = vec![0.0f64; (hi - lo + 1) as usize];
+        for (&k, &v) in map { data[(k - lo) as usize] = v; }
+        DenseMsg { offset: lo, data }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Convolution helpers  (ML-DSA: c ∈ {-1, 1}, |cav| = 2*eta+1)
+// -----------------------------------------------------------------------
+
+// out[gv + c·sv] += g[gv] · cav[sv + eta]   for gv in g, sv ∈ [-eta, eta].
+// Output support: [g.offset - eta, g.offset + g.len - 1 + eta]  (valid for |c|=1).
+//
+// Inner kernel is a (2η+1)-tap SAXPY (5 or 9 elements for ML-DSA),
+// written as a sequential slice-zip so LLVM auto-vectorises it.
+fn convadd_dense(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
+    debug_assert!(c == 1 || c == -1, "ML-DSA challenge weights must be ±1");
+    let n_cav = cav.len();                        // 2·eta + 1
+    let out_lo = g.offset - eta;                  // same for c = ±1 since |c| = 1
+    let mut out_data = vec![0.0f64; g.data.len() + 2 * eta as usize];
+
+    if c == 1 {
+        // out_idx = gv_idx + sv_idx  → sequential writes
+        for (gv_idx, &gp) in g.data.iter().enumerate() {
+            if gp == 0.0 { continue; }
+            let slice = &mut out_data[gv_idx..gv_idx + n_cav];
+            for (o, &cv) in slice.iter_mut().zip(cav) {
+                *o += gp * cv;
+            }
+        }
+    } else {
+        // c = -1: out_idx = gv_idx + (2η - sv_idx).
+        // Reversing cav keeps the write direction sequential → same SIMD benefit.
+        for (gv_idx, &gp) in g.data.iter().enumerate() {
+            if gp == 0.0 { continue; }
+            let slice = &mut out_data[gv_idx..gv_idx + n_cav];
+            for (o, &cv) in slice.iter_mut().zip(cav.iter().rev()) {
+                *o += gp * cv;
+            }
+        }
+    }
+
+    DenseMsg { offset: out_lo, data: out_data }
+}
+
+// RX_{k-1}(u) = Σ_sv cav_k(sv)·RX_k(u + c·sv) = convadd with negated c.
+fn convaddrev_dense(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
+    convadd_dense(g, cav, eta, -c)
+}
+
+// -----------------------------------------------------------------------
+// Dot product with clipped index range
+// -----------------------------------------------------------------------
+
+// dot(a, b[b_start .. b_start + a.len()]), out-of-range entries → 0.
+// When indices are fully in range (the common ML-DSA case) this reduces to
+// a plain slice dot-product that LLVM vectorises.
+fn dot_clipped(a: &[f64], b: &[f64], b_start: i32) -> f64 {
+    let b_len = b.len() as i32;
+    if b_start >= b_len || b_start + a.len() as i32 <= 0 {
+        return 0.0;
+    }
+    let (a_sl, b_sl) = if b_start >= 0 {
+        let bs = b_start as usize;
+        let len = a.len().min(b.len() - bs);
+        (&a[..len], &b[bs..bs + len])
+    } else {
+        let skip = (-b_start) as usize;
+        if skip >= a.len() { return 0.0; }
+        let len = (a.len() - skip).min(b.len());
+        (&a[skip..skip + len], &b[..len])
+    };
+    a_sl.iter().zip(b_sl).map(|(&x, &y)| x * y).sum()
 }
 
 // -----------------------------------------------------------------------
@@ -46,37 +128,47 @@ struct Trace {
 // Helpers
 // -----------------------------------------------------------------------
 
-// Cavity belief of variable j w.r.t. a specific factor:
-//   cavity_log[v] = log_key_probs_j[v] - prev_msg[v]
-// then softmax-normalized. When prev_msg is None (first iteration), uses
-// log_key_probs_j directly (equivalent to full belief = uniform for zero prior).
-fn cavity_belief(log_key_probs_j: &Msg, prev_msg: Option<&[(i32, f64)]>, n_vals: usize) -> Msg {
-    let cavity_log: Msg = match prev_msg {
-        Some(prev) => {
-            // prev is tiny (2*eta+1 entries), linear scan avoids HashMap allocation
-            log_key_probs_j
-                .iter()
-                .map(|(&v, &lp)| {
-                    let pm = prev.iter().find(|&&(k, _)| k == v).map_or(0.0, |&(_, p)| p);
-                    (v, lp - pm)
-                })
-                .collect()
-        }
-        None => log_key_probs_j.clone(),
-    };
-    let max_lp = cavity_log.values().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let raw: Msg = cavity_log.iter().map(|(&v, &l)| (v, (l - max_lp).exp())).collect();
-    let sum: f64 = raw.values().sum();
+// Returns a Vec of length 2*eta+1 where index sv+eta holds the cavity
+// probability at sv.  Dense representation avoids HashMap overhead for the
+// 5- or 9-element cavity belief used by ML-DSA.
+fn cavity_belief_dense(
+    log_key_probs_j: &Msg,
+    prev_msg: Option<&[(i32, f64)]>,
+    eta: i32,
+) -> Vec<f64> {
+    let n_vals = (2 * eta + 1) as usize;
+    let log_vals: Vec<f64> = (0..n_vals as i32)
+        .map(|sv_idx| {
+            let sv = sv_idx - eta;
+            let lp = log_key_probs_j.get(&sv).copied().unwrap_or(f64::NEG_INFINITY);
+            let pm = prev_msg
+                .and_then(|p| p.iter().find(|&&(k, _)| k == sv).map(|&(_, v)| v))
+                .unwrap_or(0.0);
+            lp - pm
+        })
+        .collect();
+
+    let max_lp = log_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if max_lp.is_infinite() {
+        return vec![1.0 / n_vals as f64; n_vals];
+    }
+
+    let mut raw: Vec<f64> = log_vals.iter().map(|&l| (l - max_lp).exp()).collect();
+    let sum: f64 = raw.iter().sum();
     if sum > 0.0 {
-        raw.into_iter().map(|(v, p)| (v, p / sum)).collect()
+        for v in &mut raw { *v /= sum; }
+        raw
     } else {
-        log_key_probs_j.keys().map(|&v| (v, 1.0 / n_vals as f64)).collect()
+        vec![1.0 / n_vals as f64; n_vals]
     }
 }
 
-// For each output i, builds left[k] and right[k] using cavity beliefs
-// (log_key_probs minus this factor's previous message), then computes the
-// factor→variable message for each connected s[j].
+// For each output i:
+//   Forward pass:  left[k] = dist of Σ_{l<k} c_l·s[j_l]   (DenseMsg, SAXPY kernel)
+//   Backward pass: rx = RX_k where RX_k(u) = Σ_r right[k](r)·msg_x(u+r).
+//                  Starts at msg_x; updated by convaddrev (convadd with -c).
+//   Message for s[j_k]:  m_k(sv) = dot(left[k].data, rx.data[left[k].offset + ck·sv - rx.offset ..])
+//                  — plain slice dot product; vectorised by LLVM.
 fn compute_contributions(
     trace: &Trace,
     log_key_probs: &[Msg],
@@ -84,73 +176,61 @@ fn compute_contributions(
     n: usize,
     eta: i32,
 ) -> FactorMsgs {
-    let n_vals = (2 * eta + 1) as usize;
     (0..n)
         .into_par_iter()
         .map(|i| {
             let c_nz = get_nonzero_for_output(&trace.challenge, i);
             let t = c_nz.len();
-            if t == 0 {
-                return vec![];
-            }
-            let msg_x = &trace.x_priors[i];
+            if t == 0 { return vec![]; }
 
-            // prev_msgs[i][k] is in the same positional order as c_nz[k] — no lookup needed
+            let msg_x = DenseMsg::from_sparse(&trace.x_priors[i]);
+
+            // prev_msgs[i][k] is in positional order matching c_nz[k]
             let prev_msgs_i: &[(usize, Vec<(i32, f64)>)] =
                 if i < prev_msgs.len() { &prev_msgs[i] } else { &[] };
 
-            // Cavity beliefs for each variable in c_nz, w.r.t. this factor (output i)
-            let cav_beliefs: Vec<Msg> = c_nz
+            // cav_beliefs[k][sv + eta] = cavity probability at sv ∈ [-eta, eta]
+            let cav_beliefs: Vec<Vec<f64>> = c_nz
                 .iter()
                 .enumerate()
                 .map(|(k, &(j, _))| {
                     let prev = prev_msgs_i.get(k).map(|(_, msg)| msg.as_slice());
-                    cavity_belief(&log_key_probs[j], prev, n_vals)
+                    cavity_belief_dense(&log_key_probs[j], prev, eta)
                 })
                 .collect();
 
-            // left[k] = dist of  sum_{l < k}  c_l * s[j_l]
-            let mut left: Vec<Msg> = Vec::with_capacity(t);
-            left.push({ let mut m = Msg::new(); m.insert(0, 1.0); m });
+            // Forward pass: left[k] = dist of Σ_{l<k} c_l·s[j_l]
+            let mut left: Vec<DenseMsg> = Vec::with_capacity(t);
+            left.push(DenseMsg::delta(0));
             for k in 0..t - 1 {
                 let (_, ck) = c_nz[k];
-                let next = convadd(&left[k], &cav_beliefs[k], ck);
+                let next = convadd_dense(&left[k], &cav_beliefs[k], eta, ck);
                 left.push(next);
             }
 
-            // right[k] = dist of  sum_{l > k}  c_l * s[j_l]
-            let mut right: Vec<Msg> = (0..t)
-                .map(|_| { let mut m = Msg::new(); m.insert(0, 1.0); m })
-                .collect();
-            for k in (0..t - 1).rev() {
-                let (_, ck) = c_nz[k + 1];
-                right[k] = convadd(&right[k + 1], &cav_beliefs[k + 1], ck);
+            // Backward pass: rx = RX_k, starts at msg_x.
+            // m_k(sv) = dot(left[k], rx[left[k].offset + ck·sv - rx.offset ..])
+            let mut rx = msg_x;
+            let mut messages: Vec<(usize, Vec<(i32, f64)>)> =
+                (0..t).map(|_| (0, vec![])).collect();
+
+            for k in (0..t).rev() {
+                let (j, ck) = c_nz[k];
+                let b_base = left[k].offset - rx.offset;   // add ck*sv per sv
+                let deltas: Vec<(i32, f64)> = (-eta..=eta)
+                    .map(|sv| {
+                        let sum = dot_clipped(&left[k].data, &rx.data, b_base + ck * sv);
+                        let lp = if sum > 0.0 { sum.ln() } else { -1e300_f64 };
+                        (sv, lp)
+                    })
+                    .collect();
+                messages[k] = (j, deltas);
+                if k > 0 {
+                    rx = convaddrev_dense(&rx, &cav_beliefs[k], eta, ck);
+                }
             }
 
-            c_nz.iter()
-                .enumerate()
-                .map(|(k, &(j, ck))| {
-                    let g_left = &left[k];
-                    let h_right = &right[k];
-                    let deltas: Vec<(i32, f64)> = (-eta..=eta)
-                        .map(|sv| {
-                            let sum: f64 = g_left
-                                .iter()
-                                .flat_map(|(&gl, &pl)| {
-                                    h_right.iter().filter_map(move |(&gr, &pr)| {
-                                        msg_x
-                                            .get(&(gl + ck * sv + gr))
-                                            .map(|&px| pl * pr * px)
-                                    })
-                                })
-                                .sum();
-                            let lp = if sum > 0.0 { sum.ln() } else { -1e300_f64 };
-                            (sv, lp)
-                        })
-                        .collect();
-                    (j, deltas)
-                })
-                .collect()
+            messages
         })
         .collect()
 }
