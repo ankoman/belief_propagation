@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 crossbeam = "0.8.0"
 itertools = "0.10.0"
 rayon = "=1.10.0"
+rustfft = "6"
 pyo3 = { version = "0.22", features = ["extension-module"] }
 
 [features]

@@ -1,6 +1,18 @@
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use rustfft::{FftPlanner, num_complex::Complex};
+use std::cell::RefCell;
 use std::collections::HashMap;
+
+type Complex64 = Complex<f64>;
+
+// Per-thread FFT planner so rayon workers don't contend on a single mutex.
+thread_local! {
+    static FFT_PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::new());
+}
+
+// Switch to FFT-based convolution when direct ops exceed this count.
+const FFT_THRESHOLD: usize = 65_536;
 
 type Msg = HashMap<i32, f64>;
 type FactorMsgs = Vec<Vec<(usize, Vec<(i32, f64)>)>>;
@@ -91,12 +103,62 @@ fn convaddrev_dense(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
 }
 
 // -----------------------------------------------------------------------
+// FFT-based convolution (for large eta where the direct SAXPY is too slow)
+// -----------------------------------------------------------------------
+
+// Linear convolution via FFT: result[d] = Σ_i a[i] * b[d-i], length a.len()+b.len()-1.
+fn linear_conv_fft(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let out_len = a.len() + b.len() - 1;
+    let n = out_len.next_power_of_two();
+    let scale = 1.0 / n as f64;
+    FFT_PLANNER.with(|p| {
+        let mut p = p.borrow_mut();
+        let fwd = p.plan_fft_forward(n);
+        let inv = p.plan_fft_inverse(n);
+        let mut ca: Vec<Complex64> = a.iter().map(|&x| Complex64::new(x, 0.0)).collect();
+        ca.resize(n, Complex64::new(0.0, 0.0));
+        let mut cb: Vec<Complex64> = b.iter().map(|&x| Complex64::new(x, 0.0)).collect();
+        cb.resize(n, Complex64::new(0.0, 0.0));
+        fwd.process(&mut ca);
+        fwd.process(&mut cb);
+        for i in 0..n { ca[i] *= cb[i]; }
+        inv.process(&mut ca);
+        ca[..out_len].iter().map(|c| c.re * scale).collect()
+    })
+}
+
+// FFT-based convadd: same semantics as convadd_dense but O(N log N).
+fn convadd_fft(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
+    debug_assert!(c == 1 || c == -1);
+    let out_lo = g.offset - eta;
+    let data = if c == 1 {
+        linear_conv_fft(&g.data, cav)
+    } else {
+        let rev: Vec<f64> = cav.iter().copied().rev().collect();
+        linear_conv_fft(&g.data, &rev)
+    };
+    DenseMsg { offset: out_lo, data }
+}
+
+// Dispatch: direct for small sizes, FFT when direct ops exceed FFT_THRESHOLD.
+fn convadd_adaptive(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
+    if g.data.len() * cav.len() > FFT_THRESHOLD {
+        convadd_fft(g, cav, eta, c)
+    } else {
+        convadd_dense(g, cav, eta, c)
+    }
+}
+
+fn convaddrev_adaptive(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
+    convadd_adaptive(g, cav, eta, -c)
+}
+
+// -----------------------------------------------------------------------
 // Dot product with clipped index range
 // -----------------------------------------------------------------------
 
 // dot(a, b[b_start .. b_start + a.len()]), out-of-range entries → 0.
-// When indices are fully in range (the common ML-DSA case) this reduces to
-// a plain slice dot-product that LLVM vectorises.
+// When fully in range this is a plain dot-product that LLVM vectorises.
 fn dot_clipped(a: &[f64], b: &[f64], b_start: i32) -> f64 {
     let b_len = b.len() as i32;
     if b_start >= b_len || b_start + a.len() as i32 <= 0 {
@@ -113,6 +175,68 @@ fn dot_clipped(a: &[f64], b: &[f64], b_start: i32) -> f64 {
         (&a[skip..skip + len], &b[..len])
     };
     a_sl.iter().zip(b_sl).map(|(&x, &y)| x * y).sum()
+}
+
+// Compute m_k(sv) = corr(left, rx)[b_base + ck·sv] for sv ∈ [-eta, eta].
+// Dispatches to FFT cross-correlation when left.len() * n_cav > FFT_THRESHOLD.
+fn compute_messages(
+    left: &DenseMsg,
+    rx: &DenseMsg,
+    eta: i32,
+    ck: i32,
+) -> Vec<(i32, f64)> {
+    let b_base = left.offset - rx.offset;
+    let n_cav = (2 * eta + 1) as usize;
+
+    if left.data.len() * n_cav > FFT_THRESHOLD {
+        // FFT cross-correlation: corr(left, rx)[d] = Σ_i left[i] * rx[i + d]
+        //   = IFFT(conj(FFT(left)) × FFT(rx))[d]
+        // For d ∈ [0, rx.len()-1] with N ≥ left.len()+rx.len()-1 this matches
+        // the linear cross-correlation (no circular aliasing).
+        let n_out = left.data.len() + rx.data.len();  // ≥ needed + 1
+        let n = n_out.next_power_of_two();
+        let scale = 1.0 / n as f64;
+        FFT_PLANNER.with(|p| {
+            let mut p = p.borrow_mut();
+            let fwd = p.plan_fft_forward(n);
+            let inv = p.plan_fft_inverse(n);
+            let mut ca: Vec<Complex64> =
+                left.data.iter().map(|&x| Complex64::new(x, 0.0)).collect();
+            ca.resize(n, Complex64::new(0.0, 0.0));
+            let mut cb: Vec<Complex64> =
+                rx.data.iter().map(|&x| Complex64::new(x, 0.0)).collect();
+            cb.resize(n, Complex64::new(0.0, 0.0));
+            fwd.process(&mut ca);
+            fwd.process(&mut cb);
+            for i in 0..n { ca[i] = ca[i].conj() * cb[i]; }
+            inv.process(&mut ca);
+            (-eta..=eta)
+                .map(|sv| {
+                    let d = b_base + ck * sv;
+                    // Linear cross-corr is valid for d ∈ [-(left.len-1), rx.len-1].
+                    // For d < 0, the circular result lives at index N + d.
+                    let la = left.data.len() as i32;
+                    let lb = rx.data.len() as i32;
+                    let sum = if d >= -(la - 1) && d < lb {
+                        let d_wrap = ((d % n as i32) + n as i32) as usize % n;
+                        ca[d_wrap].re * scale
+                    } else {
+                        0.0
+                    };
+                    let lp = if sum > 0.0 { sum.ln() } else { -1e300_f64 };
+                    (sv, lp)
+                })
+                .collect()
+        })
+    } else {
+        (-eta..=eta)
+            .map(|sv| {
+                let sum = dot_clipped(&left.data, &rx.data, b_base + ck * sv);
+                let lp = if sum > 0.0 { sum.ln() } else { -1e300_f64 };
+                (sv, lp)
+            })
+            .collect()
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -204,29 +328,21 @@ fn compute_contributions(
             left.push(DenseMsg::delta(0));
             for k in 0..t - 1 {
                 let (_, ck) = c_nz[k];
-                let next = convadd_dense(&left[k], &cav_beliefs[k], eta, ck);
+                let next = convadd_adaptive(&left[k], &cav_beliefs[k], eta, ck);
                 left.push(next);
             }
 
             // Backward pass: rx = RX_k, starts at msg_x.
-            // m_k(sv) = dot(left[k], rx[left[k].offset + ck·sv - rx.offset ..])
             let mut rx = msg_x;
             let mut messages: Vec<(usize, Vec<(i32, f64)>)> =
                 (0..t).map(|_| (0, vec![])).collect();
 
             for k in (0..t).rev() {
                 let (j, ck) = c_nz[k];
-                let b_base = left[k].offset - rx.offset;   // add ck*sv per sv
-                let deltas: Vec<(i32, f64)> = (-eta..=eta)
-                    .map(|sv| {
-                        let sum = dot_clipped(&left[k].data, &rx.data, b_base + ck * sv);
-                        let lp = if sum > 0.0 { sum.ln() } else { -1e300_f64 };
-                        (sv, lp)
-                    })
-                    .collect();
+                let deltas = compute_messages(&left[k], &rx, eta, ck);
                 messages[k] = (j, deltas);
                 if k > 0 {
-                    rx = convaddrev_dense(&rx, &cav_beliefs[k], eta, ck);
+                    rx = convaddrev_adaptive(&rx, &cav_beliefs[k], eta, ck);
                 }
             }
 
