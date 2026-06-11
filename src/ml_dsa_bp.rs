@@ -6,12 +6,10 @@ use std::collections::HashMap;
 
 type Complex64 = Complex<f64>;
 
-// Per-thread FFT planner so rayon workers don't contend on a single mutex.
 thread_local! {
     static FFT_PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::new());
 }
 
-// Switch to FFT-based convolution when direct ops exceed this count.
 const FFT_THRESHOLD: usize = 65_536;
 
 type Msg = HashMap<i32, f64>;
@@ -37,8 +35,8 @@ fn get_nonzero_for_output(c: &[i32], i: usize) -> Vec<(usize, i32)> {
 
 #[derive(Clone)]
 struct DenseMsg {
-    offset: i32,    // key at data[0]
-    data: Vec<f64>, // data[v - offset] = probability at key v
+    offset: i32,
+    data: Vec<f64>,
 }
 
 impl DenseMsg {
@@ -46,35 +44,44 @@ impl DenseMsg {
         DenseMsg { offset: v, data: vec![1.0] }
     }
 
+    // Only nonzero entries determine the dense range, so sparse priors
+    // (e.g. a delta with a large surrounding zero-filled dict) stay compact.
     fn from_sparse(map: &HashMap<i32, f64>) -> Self {
-        if map.is_empty() {
-            return DenseMsg { offset: 0, data: vec![] };
-        }
-        let lo = *map.keys().min().unwrap();
-        let hi = *map.keys().max().unwrap();
+        let lo_opt = map.iter().filter(|(_, &v)| v != 0.0).map(|(&k, _)| k).min();
+        let hi_opt = map.iter().filter(|(_, &v)| v != 0.0).map(|(&k, _)| k).max();
+        let (lo, hi) = match (lo_opt, hi_opt) {
+            (Some(lo), Some(hi)) => (lo, hi),
+            _ => return DenseMsg { offset: 0, data: vec![] },
+        };
         let mut data = vec![0.0f64; (hi - lo + 1) as usize];
-        for (&k, &v) in map { data[(k - lo) as usize] = v; }
+        for (&k, &v) in map {
+            if v != 0.0 {
+                data[(k - lo) as usize] = v;
+            }
+        }
         DenseMsg { offset: lo, data }
     }
 }
 
 // -----------------------------------------------------------------------
-// Convolution helpers  (ML-DSA: c ∈ {-1, 1}, |cav| = 2*eta+1)
+// Convolution helpers generalised to any secret range [s_min, s_max]
+//
+// out[gv + c·sv] += g[gv] · cav[sv - s_min]   for gv in g, sv ∈ [s_min, s_max].
+//
+// Output support:
+//   c =  1: [g.offset + s_min,  g.offset + g.len - 1 + s_max]
+//   c = -1: [g.offset - s_max,  g.offset + g.len - 1 - s_min]
+// Both have length  g.data.len() + (s_max - s_min).
 // -----------------------------------------------------------------------
 
-// out[gv + c·sv] += g[gv] · cav[sv + eta]   for gv in g, sv ∈ [-eta, eta].
-// Output support: [g.offset - eta, g.offset + g.len - 1 + eta]  (valid for |c|=1).
-//
-// Inner kernel is a (2η+1)-tap SAXPY (5 or 9 elements for ML-DSA),
-// written as a sequential slice-zip so LLVM auto-vectorises it.
-fn convadd_dense(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
+fn convadd_dense(g: &DenseMsg, cav: &[f64], s_min: i32, s_max: i32, c: i32) -> DenseMsg {
     debug_assert!(c == 1 || c == -1, "ML-DSA challenge weights must be ±1");
-    let n_cav = cav.len();                        // 2·eta + 1
-    let out_lo = g.offset - eta;                  // same for c = ±1 since |c| = 1
-    let mut out_data = vec![0.0f64; g.data.len() + 2 * eta as usize];
+    let n_cav = cav.len();
+    let span  = (s_max - s_min) as usize;
+    let out_lo = if c == 1 { g.offset + s_min } else { g.offset - s_max };
+    let mut out_data = vec![0.0f64; g.data.len() + span];
 
     if c == 1 {
-        // out_idx = gv_idx + sv_idx  → sequential writes
         for (gv_idx, &gp) in g.data.iter().enumerate() {
             if gp == 0.0 { continue; }
             let slice = &mut out_data[gv_idx..gv_idx + n_cav];
@@ -83,8 +90,7 @@ fn convadd_dense(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
             }
         }
     } else {
-        // c = -1: out_idx = gv_idx + (2η - sv_idx).
-        // Reversing cav keeps the write direction sequential → same SIMD benefit.
+        // c = -1: reversing cav keeps sequential write order → same SIMD benefit.
         for (gv_idx, &gp) in g.data.iter().enumerate() {
             if gp == 0.0 { continue; }
             let slice = &mut out_data[gv_idx..gv_idx + n_cav];
@@ -97,16 +103,10 @@ fn convadd_dense(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
     DenseMsg { offset: out_lo, data: out_data }
 }
 
-// RX_{k-1}(u) = Σ_sv cav_k(sv)·RX_k(u + c·sv) = convadd with negated c.
-fn convaddrev_dense(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
-    convadd_dense(g, cav, eta, -c)
-}
-
 // -----------------------------------------------------------------------
-// FFT-based convolution (for large eta where the direct SAXPY is too slow)
+// FFT-based convolution
 // -----------------------------------------------------------------------
 
-// Linear convolution via FFT: result[d] = Σ_i a[i] * b[d-i], length a.len()+b.len()-1.
 fn linear_conv_fft(a: &[f64], b: &[f64]) -> Vec<f64> {
     let out_len = a.len() + b.len() - 1;
     let n = out_len.next_power_of_two();
@@ -127,10 +127,9 @@ fn linear_conv_fft(a: &[f64], b: &[f64]) -> Vec<f64> {
     })
 }
 
-// FFT-based convadd: same semantics as convadd_dense but O(N log N).
-fn convadd_fft(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
+fn convadd_fft(g: &DenseMsg, cav: &[f64], s_min: i32, s_max: i32, c: i32) -> DenseMsg {
     debug_assert!(c == 1 || c == -1);
-    let out_lo = g.offset - eta;
+    let out_lo = if c == 1 { g.offset + s_min } else { g.offset - s_max };
     let data = if c == 1 {
         linear_conv_fft(&g.data, cav)
     } else {
@@ -140,25 +139,22 @@ fn convadd_fft(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
     DenseMsg { offset: out_lo, data }
 }
 
-// Dispatch: direct for small sizes, FFT when direct ops exceed FFT_THRESHOLD.
-fn convadd_adaptive(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
+fn convadd_adaptive(g: &DenseMsg, cav: &[f64], s_min: i32, s_max: i32, c: i32) -> DenseMsg {
     if g.data.len() * cav.len() > FFT_THRESHOLD {
-        convadd_fft(g, cav, eta, c)
+        convadd_fft(g, cav, s_min, s_max, c)
     } else {
-        convadd_dense(g, cav, eta, c)
+        convadd_dense(g, cav, s_min, s_max, c)
     }
 }
 
-fn convaddrev_adaptive(g: &DenseMsg, cav: &[f64], eta: i32, c: i32) -> DenseMsg {
-    convadd_adaptive(g, cav, eta, -c)
+fn convaddrev_adaptive(g: &DenseMsg, cav: &[f64], s_min: i32, s_max: i32, c: i32) -> DenseMsg {
+    convadd_adaptive(g, cav, s_min, s_max, -c)
 }
 
 // -----------------------------------------------------------------------
 // Dot product with clipped index range
 // -----------------------------------------------------------------------
 
-// dot(a, b[b_start .. b_start + a.len()]), out-of-range entries → 0.
-// When fully in range this is a plain dot-product that LLVM vectorises.
 fn dot_clipped(a: &[f64], b: &[f64], b_start: i32) -> f64 {
     let b_len = b.len() as i32;
     if b_start >= b_len || b_start + a.len() as i32 <= 0 {
@@ -177,23 +173,19 @@ fn dot_clipped(a: &[f64], b: &[f64], b_start: i32) -> f64 {
     a_sl.iter().zip(b_sl).map(|(&x, &y)| x * y).sum()
 }
 
-// Compute m_k(sv) = corr(left, rx)[b_base + ck·sv] for sv ∈ [-eta, eta].
-// Dispatches to FFT cross-correlation when left.len() * n_cav > FFT_THRESHOLD.
 fn compute_messages(
     left: &DenseMsg,
     rx: &DenseMsg,
-    eta: i32,
+    s_min: i32,
+    s_max: i32,
     ck: i32,
 ) -> Vec<(i32, f64)> {
     let b_base = left.offset - rx.offset;
-    let n_cav = (2 * eta + 1) as usize;
+    let n_cav = (s_max - s_min + 1) as usize;
 
     if left.data.len() * n_cav > FFT_THRESHOLD {
         // FFT cross-correlation: corr(left, rx)[d] = Σ_i left[i] * rx[i + d]
-        //   = IFFT(conj(FFT(left)) × FFT(rx))[d]
-        // For d ∈ [0, rx.len()-1] with N ≥ left.len()+rx.len()-1 this matches
-        // the linear cross-correlation (no circular aliasing).
-        let n_out = left.data.len() + rx.data.len();  // ≥ needed + 1
+        let n_out = left.data.len() + rx.data.len();
         let n = n_out.next_power_of_two();
         let scale = 1.0 / n as f64;
         FFT_PLANNER.with(|p| {
@@ -210,11 +202,9 @@ fn compute_messages(
             fwd.process(&mut cb);
             for i in 0..n { ca[i] = ca[i].conj() * cb[i]; }
             inv.process(&mut ca);
-            (-eta..=eta)
+            (s_min..=s_max)
                 .map(|sv| {
                     let d = b_base + ck * sv;
-                    // Linear cross-corr is valid for d ∈ [-(left.len-1), rx.len-1].
-                    // For d < 0, the circular result lives at index N + d.
                     let la = left.data.len() as i32;
                     let lb = rx.data.len() as i32;
                     let sum = if d >= -(la - 1) && d < lb {
@@ -229,7 +219,7 @@ fn compute_messages(
                 .collect()
         })
     } else {
-        (-eta..=eta)
+        (s_min..=s_max)
             .map(|sv| {
                 let sum = dot_clipped(&left.data, &rx.data, b_base + ck * sv);
                 let lp = if sum > 0.0 { sum.ln() } else { -1e300_f64 };
@@ -252,22 +242,22 @@ struct Trace {
 // Helpers
 // -----------------------------------------------------------------------
 
-// Returns a Vec of length 2*eta+1 where index sv+eta holds the cavity
-// probability at sv.  Dense representation avoids HashMap overhead for the
-// 5- or 9-element cavity belief used by ML-DSA.
 fn cavity_belief_dense(
     log_key_probs_j: &Msg,
     prev_msg: Option<&[(i32, f64)]>,
-    eta: i32,
+    s_min: i32,
+    s_max: i32,
 ) -> Vec<f64> {
-    let n_vals = (2 * eta + 1) as usize;
-    let log_vals: Vec<f64> = (0..n_vals as i32)
-        .map(|sv_idx| {
-            let sv = sv_idx - eta;
+    let n_vals = (s_max - s_min + 1) as usize;
+    // Build a map for O(1) prev-message lookup (important when range is wide).
+    let prev_map: HashMap<i32, f64> = prev_msg
+        .map(|p| p.iter().copied().collect())
+        .unwrap_or_default();
+
+    let log_vals: Vec<f64> = (s_min..=s_max)
+        .map(|sv| {
             let lp = log_key_probs_j.get(&sv).copied().unwrap_or(f64::NEG_INFINITY);
-            let pm = prev_msg
-                .and_then(|p| p.iter().find(|&&(k, _)| k == sv).map(|&(_, v)| v))
-                .unwrap_or(0.0);
+            let pm = prev_map.get(&sv).copied().unwrap_or(0.0);
             lp - pm
         })
         .collect();
@@ -287,18 +277,13 @@ fn cavity_belief_dense(
     }
 }
 
-// For each output i:
-//   Forward pass:  left[k] = dist of Σ_{l<k} c_l·s[j_l]   (DenseMsg, SAXPY kernel)
-//   Backward pass: rx = RX_k where RX_k(u) = Σ_r right[k](r)·msg_x(u+r).
-//                  Starts at msg_x; updated by convaddrev (convadd with -c).
-//   Message for s[j_k]:  m_k(sv) = dot(left[k].data, rx.data[left[k].offset + ck·sv - rx.offset ..])
-//                  — plain slice dot product; vectorised by LLVM.
 fn compute_contributions(
     trace: &Trace,
     log_key_probs: &[Msg],
     prev_msgs: &FactorMsgs,
     n: usize,
-    eta: i32,
+    s_min: i32,
+    s_max: i32,
 ) -> FactorMsgs {
     (0..n)
         .into_par_iter()
@@ -309,17 +294,15 @@ fn compute_contributions(
 
             let msg_x = DenseMsg::from_sparse(&trace.x_priors[i]);
 
-            // prev_msgs[i][k] is in positional order matching c_nz[k]
             let prev_msgs_i: &[(usize, Vec<(i32, f64)>)] =
                 if i < prev_msgs.len() { &prev_msgs[i] } else { &[] };
 
-            // cav_beliefs[k][sv + eta] = cavity probability at sv ∈ [-eta, eta]
             let cav_beliefs: Vec<Vec<f64>> = c_nz
                 .iter()
                 .enumerate()
                 .map(|(k, &(j, _))| {
                     let prev = prev_msgs_i.get(k).map(|(_, msg)| msg.as_slice());
-                    cavity_belief_dense(&log_key_probs[j], prev, eta)
+                    cavity_belief_dense(&log_key_probs[j], prev, s_min, s_max)
                 })
                 .collect();
 
@@ -328,7 +311,7 @@ fn compute_contributions(
             left.push(DenseMsg::delta(0));
             for k in 0..t - 1 {
                 let (_, ck) = c_nz[k];
-                let next = convadd_adaptive(&left[k], &cav_beliefs[k], eta, ck);
+                let next = convadd_adaptive(&left[k], &cav_beliefs[k], s_min, s_max, ck);
                 left.push(next);
             }
 
@@ -339,10 +322,10 @@ fn compute_contributions(
 
             for k in (0..t).rev() {
                 let (j, ck) = c_nz[k];
-                let deltas = compute_messages(&left[k], &rx, eta, ck);
+                let deltas = compute_messages(&left[k], &rx, s_min, s_max, ck);
                 messages[k] = (j, deltas);
                 if k > 0 {
-                    rx = convaddrev_adaptive(&rx, &cav_beliefs[k], eta, ck);
+                    rx = convaddrev_adaptive(&rx, &cav_beliefs[k], s_min, s_max, ck);
                 }
             }
 
@@ -359,6 +342,8 @@ fn compute_contributions(
 pub struct MLDsaBP {
     n: usize,
     eta: i32,
+    s_min: i32,
+    s_max: i32,
     traces: Vec<Trace>,
     prior: Vec<Msg>,
     log_key_probs: Vec<Msg>,
@@ -373,25 +358,43 @@ impl MLDsaBP {
             .map(|_| (-eta..=eta).map(|s| (s, 0.0f64)).collect())
             .collect();
         let log_key_probs = prior.clone();
-        MLDsaBP { n, eta, traces: Vec::new(), prior, log_key_probs, prev_factor_msgs: Vec::new() }
+        MLDsaBP {
+            n, eta, s_min: -eta, s_max: eta,
+            traces: Vec::new(), prior, log_key_probs, prev_factor_msgs: Vec::new(),
+        }
     }
 
     /// Set the prior distribution for each secret key coefficient.
     ///
     /// `prior` is a list of n dicts mapping value → probability (not log-prob).
-    /// Resets log_key_probs to the new prior.
+    /// The secret range [s_min, s_max] is inferred from the keys present in the
+    /// prior, so this works for any range — not just [-eta, eta].
     pub fn set_prior(&mut self, prior: Vec<HashMap<i32, f64>>) -> PyResult<()> {
         if prior.len() != self.n {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "prior must have length n",
             ));
         }
-        for (j, prob_map) in prior.iter().enumerate() {
-            for (&v, &p) in prob_map {
-                if let Some(lp) = self.prior[j].get_mut(&v) {
-                    *lp = if p > 0.0 { p.ln() } else { -1e300_f64 };
-                }
+
+        // Infer the secret range from every key in the provided prior.
+        let mut new_s_min = i32::MAX;
+        let mut new_s_max = i32::MIN;
+        for prob_map in &prior {
+            for &v in prob_map.keys() {
+                if v < new_s_min { new_s_min = v; }
+                if v > new_s_max { new_s_max = v; }
             }
+        }
+        if new_s_min <= new_s_max {
+            self.s_min = new_s_min;
+            self.s_max = new_s_max;
+        }
+
+        // Completely replace each variable's prior map (do not filter by old keys).
+        for (j, prob_map) in prior.iter().enumerate() {
+            self.prior[j] = prob_map.iter()
+                .map(|(&v, &p)| (v, if p > 0.0 { p.ln() } else { -1e300_f64 }))
+                .collect();
         }
         self.log_key_probs = self.prior.clone();
         Ok(())
@@ -414,26 +417,35 @@ impl MLDsaBP {
     }
 
     /// Run one BP iteration.
-    ///
-    /// Computes factor→variable messages using cavity beliefs (log_key_probs minus
-    /// this factor's previous message) for each factor-variable pair, then
-    /// replaces log_key_probs with the freshly accumulated values.
     pub fn run_iteration(&mut self) -> PyResult<()> {
-        let mut new_log_key_probs: Vec<Msg> = self.prior.clone();
-        let mut new_factor_msgs: Vec<FactorMsgs> = Vec::with_capacity(self.traces.len());
-
+        let log_key_probs = &self.log_key_probs;
+        let prev_factor_msgs = &self.prev_factor_msgs;
         let empty: FactorMsgs = Vec::new();
-        for (t, trace) in self.traces.iter().enumerate() {
-            let prev = self.prev_factor_msgs.get(t).unwrap_or(&empty);
-            let contribs = compute_contributions(trace, &self.log_key_probs, prev, self.n, self.eta);
-            for i_contribs in &contribs {
+        let n = self.n;
+        let s_min = self.s_min;
+        let s_max = self.s_max;
+
+        // Compute all trace contributions in parallel (traces are independent).
+        let new_factor_msgs: Vec<FactorMsgs> = self.traces
+            .par_iter()
+            .enumerate()
+            .map(|(t, trace)| {
+                let prev = prev_factor_msgs.get(t).unwrap_or(&empty);
+                compute_contributions(trace, log_key_probs, prev, n, s_min, s_max)
+            })
+            .collect();
+
+        let mut new_log_key_probs: Vec<Msg> = self.prior.clone();
+        for contribs in &new_factor_msgs {
+            for i_contribs in contribs {
                 for (j, deltas) in i_contribs {
                     for (sv, delta) in deltas {
-                        *new_log_key_probs[*j].get_mut(sv).unwrap() += delta;
+                        if let Some(lp) = new_log_key_probs[*j].get_mut(sv) {
+                            *lp += delta;
+                        }
                     }
                 }
             }
-            new_factor_msgs.push(contribs);
         }
 
         self.log_key_probs = new_log_key_probs;
@@ -481,7 +493,7 @@ impl MLDsaBP {
     }
 
     /// Clear stored factor→variable messages so the next run_iteration uses
-    /// full beliefs instead of cavity beliefs (reproduces the old behaviour).
+    /// full beliefs instead of cavity beliefs.
     pub fn clear_prev_messages(&mut self) {
         for msgs in &mut self.prev_factor_msgs {
             msgs.clear();

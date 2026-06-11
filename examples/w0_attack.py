@@ -110,6 +110,7 @@ def run_attack(
         x_min = tau * -4098
         x_max = tau * 4097
         correct_secret = s2[attack_idx] - t0[attack_idx] 
+        correct_secret.mod_pm()
         p_unif = 1.0 / (4097+4098)
         bp.set_prior([{v: p_unif for v in range(-4098, 4097 + 1)} for _ in range(n)])
 
@@ -153,7 +154,7 @@ def run_attack(
 
 if __name__ == "__main__":
     configs = [
-        ("ML-DSA-44 n=256", 256, 2,   39,  0.0, 10),
+        ("ML-DSA-44 n=256", 256, 2,   39,  0.0, 50),
     ]
 
     ### with t0
