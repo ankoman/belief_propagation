@@ -103,13 +103,13 @@ def run_attack(
     if t0_is_known:
         x_min = -tau * eta
         x_max =  tau * eta
-        recovered_secret = s2[attack_idx]
+        correct_secret = s2[attack_idx]
         p_unif = 1.0 / (2 * eta + 1)
         bp.set_prior([{v: p_unif for v in range(-eta, eta + 1)} for _ in range(n)])
     else:
         x_min = tau * -4098
         x_max = tau * 4097
-        recovered_secret = s2[attack_idx] - t0[attack_idx] 
+        correct_secret = s2[attack_idx] - t0[attack_idx] 
         p_unif = 1.0 / (4097+4098)
         bp.set_prior([{v: p_unif for v in range(-4098, 4097 + 1)} for _ in range(n)])
 
@@ -136,15 +136,17 @@ def run_attack(
         bp.run_iteration()
         est      = bp.get_map_estimate()
         lp       = bp.get_log_key_probs()
-        ok       = sum(e == s for e, s in zip(est, recovered_secret))
-        rec      = count_recovered(est, recovered_secret, lp)
+        ok       = sum(e == s for e, s in zip(est, correct_secret))
+        print(est)
+        print(correct_secret)
+        rec      = count_recovered(est, correct_secret, lp)
         elapsed  = time.perf_counter() - t_start
         print(f"  iter={it}  correct={ok}/{n} ({100*ok/n:.1f}%)  recovered={rec}/{n}  [{elapsed:.1f}s]")
 
     est     = bp.get_map_estimate()
     lp      = bp.get_log_key_probs()
-    ok      = sum(e == s for e, s in zip(est, recovered_secret))
-    rec     = count_recovered(est, recovered_secret, lp)
+    ok      = sum(e == s for e, s in zip(est, correct_secret))
+    rec     = count_recovered(est, correct_secret, lp)
     elapsed = time.perf_counter() - t_start
     return ok, rec, n, elapsed
 
@@ -166,10 +168,10 @@ if __name__ == "__main__":
     #         list_traces.append((w0, c, x_D))
 
     # for label, n, eta, tau, _, iters in configs:
-    #     for p_bit_error in [0.42]:
+    #     for p_bit_error in [0.4]:
     #         for num_traces in [70, 80, 90, 100]:
     #             print(f"\n=== {label}  (eta={eta}, tau={tau}, p_bit_error={p_bit_error}) ===")
-    #             ok, rec, n_, elapsed = run_attack(n, eta, tau, p_bit_error, list_traces[:num_traces], s2, w0, num_iterations=iters)
+    #             ok, rec, n_, elapsed = run_attack(n, eta, tau, p_bit_error, list_traces[:num_traces], s2, w0, t0, num_iterations=iters)
     #             print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")
 
     ### without t0

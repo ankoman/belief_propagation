@@ -18,6 +18,7 @@ import random
 import time
 import sys
 from typing import Dict, List, Tuple
+import numpy as np
 
 try:
     from belief_propagation import MLDsaBP
@@ -97,6 +98,8 @@ def count_recovered(
 ) -> int:
     """Largest K s.t. top-K most confident (lowest entropy) MAP estimates are all correct."""
     entropies = [_entropy(lp) for lp in log_probs]
+    print(f"Average entropy: {sum(entropies)/len(entropies)}",end=', ')
+    print(f'Average distance: {np.abs(np.array(est)-np.array(secret.coeff)).mean()}')
     order = sorted(range(len(entropies)), key=lambda i: entropies[i])
     count = 0
     for idx in order:
