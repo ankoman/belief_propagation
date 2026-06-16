@@ -109,22 +109,21 @@ def run_attack(
     else:
         x_min = tau * -4098
         x_max = tau * 4097
-        correct_secret = s2[attack_idx] - t0[attack_idx] 
+        correct_secret = s2[attack_idx] - t0[attack_idx]
         correct_secret.mod_pm()
-        p_unif = 1.0 / (4097+4098)
+        p_unif = 1.0 / (4097 + 4098 + 1)
         bp.set_prior([{v: p_unif for v in range(-4098, 4097 + 1)} for _ in range(n)])
+        bp.set_damping(0.5)  # loopy BP stabilization for wide secret range
 
 
-    # Phase 2: add traces with noisy observations
+    # Phase 1: add traces with noisy observations
     for w0, c, xD in list_traces:
         c.mod_pm()
         xD[attack_idx].mod_pm()
         x_priors = []
         for w0_true, xD_i in zip(w0[attack_idx], xD[attack_idx]):
             if p_bit_error == 0.0:
-                dict_t = {x: 0.0 for x in range(x_min, x_max + 1)}
-                dict_t[w0_true - xD_i] = 1.0
-                x_priors.append(dict_t)
+                x_priors.append({w0_true - xD_i: 1.0})
             else:
                 w0_obs = flip_bits_7bit(w0_true, p_bit_error)
                 dict_t = gen_x_priors(w0_obs, xD_i, x_min, x_max, p_bit_error)
@@ -154,7 +153,7 @@ def run_attack(
 
 if __name__ == "__main__":
     configs = [
-        ("ML-DSA-44 n=256", 256, 2,   39,  0.0, 50),
+        ("ML-DSA-44 n=256", 256, 2,   39,  0.0, 10),
     ]
 
     ### with t0
