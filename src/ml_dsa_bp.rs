@@ -348,6 +348,9 @@ pub struct MLDsaBP {
     prior: Vec<Msg>,
     log_key_probs: Vec<Msg>,
     prev_factor_msgs: Vec<FactorMsgs>,
+    /// Fraction of the old message kept when mixing new and previous factor messages.
+    /// 0.0 = no damping (pure new message), 0.5 = equal mix, 0.9 = very conservative.
+    damping: f64,
 }
 
 #[pymethods]
@@ -361,7 +364,15 @@ impl MLDsaBP {
         MLDsaBP {
             n, eta, s_min: -eta, s_max: eta,
             traces: Vec::new(), prior, log_key_probs, prev_factor_msgs: Vec::new(),
+            damping: 0.0,
         }
+    }
+
+    /// Set the message damping factor (0.0 = no damping, 1.0 = freeze).
+    /// Damped message = log((1-d)*exp(new) + d*exp(old)).
+    /// Recommended: 0.5 for the t0-unknown attack with a wide secret range.
+    pub fn set_damping(&mut self, damping: f64) {
+        self.damping = damping.clamp(0.0, 1.0);
     }
 
     /// Set the prior distribution for each secret key coefficient.
@@ -426,7 +437,7 @@ impl MLDsaBP {
         let s_max = self.s_max;
 
         // Compute all trace contributions in parallel (traces are independent).
-        let new_factor_msgs: Vec<FactorMsgs> = self.traces
+        let mut new_factor_msgs: Vec<FactorMsgs> = self.traces
             .par_iter()
             .enumerate()
             .map(|(t, trace)| {
@@ -434,6 +445,39 @@ impl MLDsaBP {
                 compute_contributions(trace, log_key_probs, prev, n, s_min, s_max)
             })
             .collect();
+
+        // Apply message damping: mix new and previous messages in probability space.
+        // damped = log((1-d)*exp(new) + d*exp(prev))
+        if self.damping > 0.0 {
+            let log_new_w  = (1.0 - self.damping).ln();
+            let log_prev_w = self.damping.ln();
+            for (t, trace_msgs) in new_factor_msgs.iter_mut().enumerate() {
+                let prev = match self.prev_factor_msgs.get(t) {
+                    Some(p) if !p.is_empty() => p,
+                    _ => continue,
+                };
+                for (i, output_msgs) in trace_msgs.iter_mut().enumerate() {
+                    let prev_i = match prev.get(i) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    for (k, (_, new_deltas)) in output_msgs.iter_mut().enumerate() {
+                        let prev_deltas = match prev_i.get(k) {
+                            Some((_, d)) => d,
+                            None => continue,
+                        };
+                        for (idx, (_, new_lp)) in new_deltas.iter_mut().enumerate() {
+                            if let Some((_, prev_lp)) = prev_deltas.get(idx) {
+                                let a = log_new_w  + *new_lp;
+                                let b = log_prev_w + *prev_lp;
+                                let m = a.max(b);
+                                *new_lp = m + ((a - m).exp() + (b - m).exp()).ln();
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let mut new_log_key_probs: Vec<Msg> = self.prior.clone();
         for contribs in &new_factor_msgs {
