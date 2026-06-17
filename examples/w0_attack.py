@@ -6,7 +6,7 @@ import numpy as np
 from typing import Dict, List, Tuple
 from ml_dsa_attack import count_recovered
 try:
-    from belief_propagation import MLDsaBP
+    from belief_propagation import MLDsaBP, gen_x_priors_parallel
 except ImportError:
     sys.exit(
         "belief_propagation not found – run `maturin develop` inside .venv first."
@@ -63,9 +63,9 @@ class polyRing:
             if self.coeff[i] > self.q // 2:
                 self.coeff[i] -= self.q
 
-def flip_bits_7bit(x, p_bit_error):
-    y = x & 0x7F  # 7bitに制限
-    for i in range(7):
+def flip_bits_nbit(x, p_bit_error, n_bits):
+    y = x & ((1 << n_bits) - 1)  # nbitに制限
+    for i in range(n_bits):
         if random.random() < p_bit_error:
             y ^= (1 << i)
     return y
@@ -73,10 +73,10 @@ def flip_bits_7bit(x, p_bit_error):
 def hw(x):
     return bin(x).count("1")
 
-def gen_x_priors(w0_obs, xD_i, x_min, x_max, p_bit_error):
+def gen_x_priors(w0_obs, xD_i, x_min, x_max, p_bit_error, n_bits) -> Dict[int, float]:
     dict_t = {}
     for v in range(x_min, x_max + 1):
-        hd = hw(((v+xD_i) ^ w0_obs) & 0x7F)
+        hd = hw(((v+xD_i) ^ w0_obs) & ((1 << n_bits) - 1))
         dict_t[v] = (1-p_bit_error)**hd
     return dict_t
 
@@ -106,6 +106,8 @@ def run_attack(
         correct_secret = s2[attack_idx]
         p_unif = 1.0 / (2 * eta + 1)
         bp.set_prior([{v: p_unif for v in range(-eta, eta + 1)} for _ in range(n)])
+        n_bits = 8
+        bp.set_damping(0.0)
     else:
         x_min = tau * -4098
         x_max = tau * 4097
@@ -113,21 +115,19 @@ def run_attack(
         correct_secret.mod_pm()
         p_unif = 1.0 / (4097 + 4098 + 1)
         bp.set_prior([{v: p_unif for v in range(-4098, 4097 + 1)} for _ in range(n)])
-        bp.set_damping(0.5)  # loopy BP stabilization for wide secret range
+        n_bits = 18
+        bp.set_damping(0.0)  # loopy BP stabilization for wide secret range. 0 is no effect
 
 
     # Phase 1: add traces with noisy observations
     for w0, c, xD in list_traces:
         c.mod_pm()
         xD[attack_idx].mod_pm()
-        x_priors = []
-        for w0_true, xD_i in zip(w0[attack_idx], xD[attack_idx]):
-            if p_bit_error == 0.0:
-                x_priors.append({w0_true - xD_i: 1.0})
-            else:
-                w0_obs = flip_bits_7bit(w0_true, p_bit_error)
-                dict_t = gen_x_priors(w0_obs, xD_i, x_min, x_max, p_bit_error)
-                x_priors.append(dict_t)
+        if p_bit_error == 0.0:
+            x_priors = [{w0_true - xD_i: 1.0} for w0_true, xD_i in zip(w0[attack_idx], xD[attack_idx])]
+        else:
+            w0_obs_list = [flip_bits_nbit(w0_true, p_bit_error, n_bits) for w0_true in w0[attack_idx].coeff]
+            x_priors = gen_x_priors_parallel(w0_obs_list, xD[attack_idx].coeff, x_min, x_max, p_bit_error, n_bits)
         bp.add_trace(c, x_priors)
     print(f"  collected {bp.trace_count()} traces  [{time.perf_counter()-t_start:.1f}s]")
 
@@ -137,23 +137,24 @@ def run_attack(
         est      = bp.get_map_estimate()
         lp       = bp.get_log_key_probs()
         ok       = sum(e == s for e, s in zip(est, correct_secret))
-        print(est)
-        print(correct_secret)
         rec      = count_recovered(est, correct_secret, lp)
         elapsed  = time.perf_counter() - t_start
         print(f"  iter={it}  correct={ok}/{n} ({100*ok/n:.1f}%)  recovered={rec}/{n}  [{elapsed:.1f}s]")
+        if ok == 256:
+            print("Attack success: all coefficients recovered, stopping early.")
+            break
 
-    est     = bp.get_map_estimate()
-    lp      = bp.get_log_key_probs()
-    ok      = sum(e == s for e, s in zip(est, correct_secret))
-    rec     = count_recovered(est, correct_secret, lp)
-    elapsed = time.perf_counter() - t_start
+    # est     = bp.get_map_estimate()
+    # lp      = bp.get_log_key_probs()
+    # ok      = sum(e == s for e, s in zip(est, correct_secret))
+    # rec     = count_recovered(est, correct_secret, lp)
+    # elapsed = time.perf_counter() - t_start
     return ok, rec, n, elapsed
 
 
 if __name__ == "__main__":
     configs = [
-        ("ML-DSA-44 n=256", 256, 2,   39,  0.0, 10),
+        ("ML-DSA-44 n=256", 256, 2,   39,  0.05, 30),
     ]
 
     ### with t0
@@ -169,7 +170,7 @@ if __name__ == "__main__":
 
     # for label, n, eta, tau, _, iters in configs:
     #     for p_bit_error in [0.4]:
-    #         for num_traces in [70, 80, 90, 100]:
+    #         for num_traces in [40]:
     #             print(f"\n=== {label}  (eta={eta}, tau={tau}, p_bit_error={p_bit_error}) ===")
     #             ok, rec, n_, elapsed = run_attack(n, eta, tau, p_bit_error, list_traces[:num_traces], s2, w0, t0, num_iterations=iters)
     #             print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")
@@ -187,5 +188,5 @@ if __name__ == "__main__":
 
     for label, n, eta, tau, p_bit_error, num_traces in configs:
         print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, p_bit_error={p_bit_error}) ===")
-        ok, rec, n_, elapsed = run_attack(n, eta, tau, p_bit_error, list_traces[:num_traces], s2, w0, t0, num_iterations=10, t0_is_known=False)
+        ok, rec, n_, elapsed = run_attack(n, eta, tau, p_bit_error, list_traces[:num_traces], s2, w0, t0, num_iterations=50, t0_is_known=False)
         print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")

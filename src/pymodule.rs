@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::ml_dsa_bp::MLDsaBP;
@@ -340,6 +341,54 @@ impl PyBPGraph {
 }
 
 // -----------------------------------------------------------------------
+// Parallel gen_x_priors
+// -----------------------------------------------------------------------
+
+/// Compute x_priors for all n polynomial coefficients in parallel.
+///
+/// For each coefficient i, returns a dict mapping each v in [x_min, x_max] to
+/// `(1 - p_bit_error) ** hamming_weight((v + xd_list[i]) XOR w0_obs_list[i] & mask)`.
+///
+/// This is the Rust+Rayon equivalent of the Python `gen_x_priors` inner loop in w0_attack.py.
+#[pyfunction]
+pub fn gen_x_priors_parallel(
+    py: Python<'_>,
+    w0_obs_list: Vec<i32>,
+    xd_list: Vec<i32>,
+    x_min: i32,
+    x_max: i32,
+    p_bit_error: f64,
+    n_bits: u32,
+) -> PyResult<Vec<HashMap<i32, f64>>> {
+    if w0_obs_list.len() != xd_list.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "w0_obs_list and xd_list must have the same length",
+        ));
+    }
+    let mask = (1i32 << n_bits) - 1;
+    let base = 1.0_f64 - p_bit_error;
+
+    let result = py.allow_threads(|| {
+        (0..w0_obs_list.len())
+            .into_par_iter()
+            .map(|i| {
+                let w0_obs = w0_obs_list[i];
+                let xd_i = xd_list[i];
+                (x_min..=x_max)
+                    .map(|v| {
+                        let hw = ((v.wrapping_add(xd_i)) ^ w0_obs) & mask;
+                        let hw = hw.count_ones();
+                        (v, base.powi(hw as i32))
+                    })
+                    .collect::<HashMap<i32, f64>>()
+            })
+            .collect::<Vec<_>>()
+    });
+
+    Ok(result)
+}
+
+// -----------------------------------------------------------------------
 // Module entry point
 // -----------------------------------------------------------------------
 
@@ -347,5 +396,6 @@ impl PyBPGraph {
 pub fn belief_propagation(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBPGraph>()?;
     m.add_class::<MLDsaBP>()?;
+    m.add_function(wrap_pyfunction!(gen_x_priors_parallel, m)?)?;
     Ok(())
 }
