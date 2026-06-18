@@ -3,6 +3,7 @@ import random
 import time
 import sys, pickle
 import numpy as np
+import click
 from typing import Dict, List, Tuple
 from ml_dsa_attack import count_recovered
 try:
@@ -89,16 +90,18 @@ def run_attack(
     s2,
     w0,
     t0,
+    num_traces: int = 10,
     num_iterations: int = 5,
     seed: int = 10,
     t0_is_known: bool = True,
+    damping = 0.0,
 ) -> Tuple[float, float]:
 
     rng = random.Random(seed)
     attack_idx = 0
     t_start = time.perf_counter()
     bp = MLDsaBP(n, eta)
-
+    bp.set_damping(damping)  # loopy BP stabilization for wide secret range. 0 is no effect
 
     if t0_is_known:
         x_min = -tau * eta
@@ -116,11 +119,10 @@ def run_attack(
         p_unif = 1.0 / (4097 + 4098 + 1)
         bp.set_prior([{v: p_unif for v in range(-4098, 4097 + 1)} for _ in range(n)])
         n_bits = 18
-        bp.set_damping(0.0)  # loopy BP stabilization for wide secret range. 0 is no effect
 
 
     # Phase 1: add traces with noisy observations
-    for w0, c, xD in list_traces:
+    for w0, c, xD in list_traces[:num_traces]:
         c.mod_pm()
         xD[attack_idx].mod_pm()
         if p_bit_error == 0.0:
@@ -133,13 +135,15 @@ def run_attack(
 
     # Phase 2: iterate BP
     for it in range(1, num_iterations + 1):
+        print(f"- iter={it} ",end="")
         bp.run_iteration()
         est      = bp.get_map_estimate()
         lp       = bp.get_log_key_probs()
         ok       = sum(e == s for e, s in zip(est, correct_secret))
         rec      = count_recovered(est, correct_secret, lp)
+        maximum = max(abs(e - s) for e,s in zip(est, correct_secret))
         elapsed  = time.perf_counter() - t_start
-        print(f"  iter={it}  correct={ok}/{n} ({100*ok/n:.1f}%)  recovered={rec}/{n}  [{elapsed:.1f}s]")
+        print(f"Corr={ok}/{n} ({100*ok/n:.1f}%)  Recov={rec}/{n}  [{elapsed:.1f}s]")
         if ok == 256:
             print("Attack success: all coefficients recovered, stopping early.")
             break
@@ -152,41 +156,40 @@ def run_attack(
     return ok, rec, n, elapsed
 
 
-if __name__ == "__main__":
-    configs = [
-        ("ML-DSA-44 n=256", 256, 2,   39,  0.05, 30),
-    ]
+@click.command()
+@click.option("--p-bit-error", default=0.0,  show_default=True, type=float, help="Bit-flip error rate for observations.")
+@click.option("--num-traces",  default=50,    show_default=True, type=int,   help="Number of traces to use.")
+@click.option("--num-iter",    default=50,    show_default=True, type=int,   help="Maximum BP iterations.")
+@click.option("--damping",     default=0.0,   show_default=True, type=float, help="Message damping factor (0=none, 0.5=recommended for t0-unknown).")
+@click.option("--t0-known",    is_flag=True,  default=False,                 help="Use t0-known mode (default: t0-unknown).")
+def main(p_bit_error, num_traces, num_iter, damping, t0_known):
+    n, eta, tau = 256, 2, 39
+    t0_is_known = t0_known
 
-    ### with t0
-    # list_traces = []
-    # with open("traces_t0_known_100.pkl", "rb") as f:
-    #     t0 = pickle.load(f)
-    #     s2 = pickle.load(f)
-    #     for _ in range(100):
-    #         w0 = pickle.load(f)
-    #         c = pickle.load(f)
-    #         x_D = pickle.load(f)
-    #         list_traces.append((w0, c, x_D))
+    if t0_is_known:
+        trace_file = "traces_t0_known_100.pkl"
+    else:
+        trace_file = "traces_t0_unknown_100.pkl"
 
-    # for label, n, eta, tau, _, iters in configs:
-    #     for p_bit_error in [0.4]:
-    #         for num_traces in [40]:
-    #             print(f"\n=== {label}  (eta={eta}, tau={tau}, p_bit_error={p_bit_error}) ===")
-    #             ok, rec, n_, elapsed = run_attack(n, eta, tau, p_bit_error, list_traces[:num_traces], s2, w0, t0, num_iterations=iters)
-    #             print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")
-
-    ### without t0
     list_traces = []
-    with open("traces_t0_unknown_100.pkl", "rb") as f:
+    with open(trace_file, "rb") as f:
         t0 = pickle.load(f)
         s2 = pickle.load(f)
         for _ in range(100):
             w0 = pickle.load(f)
-            c = pickle.load(f)
-            x_D = pickle.load(f)
-            list_traces.append((w0, c, x_D))
+            c  = pickle.load(f)
+            xD = pickle.load(f)
+            list_traces.append((w0, c, xD))
 
-    for label, n, eta, tau, p_bit_error, num_traces in configs:
-        print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, p_bit_error={p_bit_error}) ===")
-        ok, rec, n_, elapsed = run_attack(n, eta, tau, p_bit_error, list_traces[:num_traces], s2, w0, t0, num_iterations=50, t0_is_known=False)
-        print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")
+    label = f"ML-DSA-44 n={n} ({'t0-known' if t0_is_known else 't0-unknown'})"
+    print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, p_bit_error={p_bit_error}, damping={damping}) ===")
+    ok, rec, n_, elapsed = run_attack(
+        n, eta, tau, p_bit_error, list_traces, s2, w0, t0,
+        num_traces=num_traces, num_iterations=num_iter,
+        t0_is_known=t0_is_known, damping=damping,
+    )
+    print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

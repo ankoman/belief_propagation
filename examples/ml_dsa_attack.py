@@ -98,8 +98,9 @@ def count_recovered(
 ) -> int:
     """Largest K s.t. top-K most confident (lowest entropy) MAP estimates are all correct."""
     entropies = [_entropy(lp) for lp in log_probs]
-    print(f"Average entropy: {sum(entropies)/len(entropies)}",end=', ')
-    print(f'Average distance: {np.abs(np.array(est)-np.array(secret.coeff)).mean()}')
+    print(f"Ave ent: {sum(entropies)/len(entropies):.5f}",end=', ')
+    print(f'Ave dist: {np.abs(np.array(est)-np.array(secret.coeff)).mean():.5f}',end=', ')
+    print(f'Max dist: {max(abs(e - s) for e,s in zip(est, secret.coeff))}',end=', ')
     order = sorted(range(len(entropies)), key=lambda i: entropies[i])
     count = 0
     for idx in order:
