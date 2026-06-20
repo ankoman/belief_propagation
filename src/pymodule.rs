@@ -346,10 +346,15 @@ impl PyBPGraph {
 
 /// Compute x_priors for all n polynomial coefficients in parallel.
 ///
-/// For each coefficient i, returns a dict mapping each v in [x_min, x_max] to
-/// `(1 - p_bit_error) ** hamming_weight((v + xd_list[i]) XOR w0_obs_list[i] & mask)`.
+/// For each coefficient i the effective x range is first narrowed by the
+/// ML-DSA hint-bit constraint, then a likelihood dict is built:
+///   `(1 - p_bit_error) ** popcount((w0_obs[i] XOR (xd[i] + x_est)) & mask)`
 ///
-/// This is the Rust+Rayon equivalent of the Python `gen_x_priors` inner loop in w0_attack.py.
+/// Hint-bit range narrowing (mirrors the Python `gen_x_priors`):
+///   h_i == 0  →  x_est ∈ [-beta - B - azct1[i],  beta + B - azct1[i]]
+///   h_i == 1, azct1[i] > 0  →  x_est ≥ -beta + B - azct1[i]
+///   h_i == 1, azct1[i] ≤ 0  →  x_est ≤  beta - B - azct1[i]
+/// The result is further clipped to [x_min, x_max].
 #[pyfunction]
 pub fn gen_x_priors_parallel(
     py: Python<'_>,
@@ -357,28 +362,48 @@ pub fn gen_x_priors_parallel(
     xd_list: Vec<i32>,
     x_min: i32,
     x_max: i32,
+    azct1_low_list: Vec<i32>,
+    h_list: Vec<i32>,
+    b: i32,
+    c: i32,
+    beta: i32,
     p_bit_error: f64,
     n_bits: u32,
 ) -> PyResult<Vec<HashMap<i32, f64>>> {
-    if w0_obs_list.len() != xd_list.len() {
+    let n = w0_obs_list.len();
+    if xd_list.len() != n || azct1_low_list.len() != n || h_list.len() != n {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "w0_obs_list and xd_list must have the same length",
+            "w0_obs_list, xd_list, azct1_low_list, and h_list must all have the same length",
         ));
     }
     let mask = (1i32 << n_bits) - 1;
     let base = 1.0_f64 - p_bit_error;
 
     let result = py.allow_threads(|| {
-        (0..w0_obs_list.len())
+        (0..n)
             .into_par_iter()
             .map(|i| {
-                let w0_obs = w0_obs_list[i];
-                let xd_i = xd_list[i];
-                (x_min..=x_max)
-                    .map(|v| {
-                        let hw = ((v.wrapping_add(xd_i)) ^ w0_obs) & mask;
-                        let hw = hw.count_ones();
-                        (v, base.powi(hw as i32))
+                let w0_obs    = w0_obs_list[i];
+                let xd_i      = xd_list[i];
+                let azct1     = azct1_low_list[i];
+                let h_i       = h_list[i];
+
+                // Hint-bit range constraint (arithmetic is within i32 for typical ML-DSA values).
+                let (hint_min, hint_max) = if h_i == 0 {
+                    (-beta - b - azct1, beta + b - azct1)
+                } else if azct1 > 0 {
+                    (-beta + c - azct1, i32::MAX)
+                } else {
+                    (i32::MIN, beta - c - azct1)
+                };
+
+                let eff_min = x_min.max(hint_min);
+                let eff_max = x_max.min(hint_max);
+
+                (eff_min..=eff_max)
+                    .map(|x_est| {
+                        let hd = (w0_obs ^ (xd_i + x_est)) & mask;
+                        (x_est, base.powi(hd.count_ones() as i32))
                     })
                     .collect::<HashMap<i32, f64>>()
             })

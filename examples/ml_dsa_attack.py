@@ -100,7 +100,7 @@ def count_recovered(
     entropies = [_entropy(lp) for lp in log_probs]
     print(f"Ave ent: {sum(entropies)/len(entropies):.5f}",end=', ')
     print(f'Ave dist: {np.abs(np.array(est)-np.array(secret.coeff)).mean():.5f}',end=', ')
-    print(f'Max dist: {max(abs(e - s) for e,s in zip(est, secret.coeff))}',end=', ')
+    print(f'Max dist: {max(abs(e - s) for e,s in zip(est, secret.coeff))}')
     order = sorted(range(len(entropies)), key=lambda i: entropies[i])
     count = 0
     for idx in order:
