@@ -346,16 +346,17 @@ impl PyBPGraph {
 
 /// Compute x_priors for all n polynomial coefficients in parallel.
 ///
-/// For each coefficient i the effective x range is first narrowed by the
-/// ML-DSA hint-bit constraint, then a likelihood dict is built:
+/// For each coefficient i a likelihood dict is built:
 ///   `(1 - p_bit_error) ** popcount((w0_obs[i] XOR (xd[i] + x_est)) & mask)`
 ///
-/// Hint-bit range narrowing (mirrors the Python `gen_x_priors`):
+/// When `use_hint` is true the effective x range is first narrowed by the
+/// ML-DSA hint-bit constraint (mirrors the Python `gen_x_priors` USE_HINT):
 ///   h_i == 0  →  x_est ∈ [-beta - B - azct1[i],  beta + B - azct1[i]]
-///   h_i == 1, azct1[i] > 0  →  x_est ≥ -beta + B - azct1[i]
-///   h_i == 1, azct1[i] ≤ 0  →  x_est ≤  beta - B - azct1[i]
+///   h_i == 1, azct1[i] > 0  →  x_est ≥ -beta + C - azct1[i]
+///   h_i == 1, azct1[i] ≤ 0  →  x_est ≤  beta - C - azct1[i]
 /// The result is further clipped to [x_min, x_max].
 #[pyfunction]
+#[pyo3(signature = (w0_obs_list, xd_list, x_min, x_max, azct1_low_list, h_list, b, c, beta, p_bit_error, n_bits, use_hint=false))]
 pub fn gen_x_priors_parallel(
     py: Python<'_>,
     w0_obs_list: Vec<i32>,
@@ -369,13 +370,14 @@ pub fn gen_x_priors_parallel(
     beta: i32,
     p_bit_error: f64,
     n_bits: u32,
+    use_hint: bool,
 ) -> PyResult<Vec<HashMap<i32, f64>>> {
     let n = w0_obs_list.len();
-    if xd_list.len() != n || azct1_low_list.len() != n || h_list.len() != n {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "w0_obs_list, xd_list, azct1_low_list, and h_list must all have the same length",
-        ));
-    }
+    // if xd_list.len() != n || azct1_low_list.len() != n || h_list.len() != n {
+    //     return Err(pyo3::exceptions::PyValueError::new_err(
+    //         "w0_obs_list, xd_list, azct1_low_list, and h_list must all have the same length",
+    //     ));
+    // }
     let mask = (1i32 << n_bits) - 1;
     let base = 1.0_f64 - p_bit_error;
 
@@ -383,22 +385,24 @@ pub fn gen_x_priors_parallel(
         (0..n)
             .into_par_iter()
             .map(|i| {
-                let w0_obs    = w0_obs_list[i];
-                let xd_i      = xd_list[i];
-                let azct1     = azct1_low_list[i];
-                let h_i       = h_list[i];
+                let w0_obs = w0_obs_list[i];
+                let xd_i   = xd_list[i];
 
-                // Hint-bit range constraint (arithmetic is within i32 for typical ML-DSA values).
-                let (hint_min, hint_max) = if h_i == 0 {
-                    (-beta - b - azct1, beta + b - azct1)
-                } else if azct1 > 0 {
-                    (-beta + c - azct1, i32::MAX)
+                let (eff_min, eff_max) = if use_hint {
+                    let azct1  = azct1_low_list[i];
+                    let h_i    = h_list[i];
+                    // Hint-bit range constraint.
+                    let (hint_min, hint_max) = if h_i == 0 {
+                        (-beta - b - azct1, beta + b - azct1)
+                    } else if azct1 > 0 {
+                        (-beta + c - azct1, i32::MAX)
+                    } else {
+                        (i32::MIN, beta - c - azct1)
+                    };
+                    (x_min.max(hint_min), x_max.min(hint_max))
                 } else {
-                    (i32::MIN, beta - c - azct1)
+                    (x_min, x_max)
                 };
-
-                let eff_min = x_min.max(hint_min);
-                let eff_max = x_max.min(hint_max);
 
                 (eff_min..=eff_max)
                     .map(|x_est| {

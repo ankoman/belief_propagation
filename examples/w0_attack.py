@@ -74,8 +74,7 @@ def flip_bits_nbit(x, p_bit_error, n_bits):
 def hw(x):
     return bin(x).count("1")
 
-def gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, B, C, beta, p_bit_error, n_bits) -> Dict[int, float]:
-    USE_HINT = True
+def gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, B, C, beta, p_bit_error, n_bits, USE_HINT = False) -> Dict[int, float]:
     if USE_HINT:
         x_min_t = -999999999
         x_max_t =  999999999
@@ -106,11 +105,11 @@ def run_attack(
     s2,
     w0,
     t0,
-    num_traces: int = 10,
     num_iterations: int = 5,
     seed: int = 10,
     t0_is_known: bool = True,
     damping = 0.0,
+    use_hint: bool = False,
 ) -> Tuple[float, float]:
 
     rng = random.Random(seed)
@@ -139,7 +138,7 @@ def run_attack(
     C = 95232 + tau*eta + 1
 
     # Phase 1: add traces with noisy observations
-    for w0, c, xD, Azct1_low, h in list_traces[:num_traces]:
+    for w0, c, xD, Azct1_low, h in list_traces:
         c.mod_pm()
         xD[attack_idx].mod_pm()
         x_priors = []
@@ -160,10 +159,11 @@ def run_attack(
                 w0_obs_list,
                 list(xD[attack_idx].coeff),
                 x_min, x_max,
-                list(Azct1_low[attack_idx].coeff),
-                list(h[attack_idx].coeff),
+                list(Azct1_low[attack_idx].coeff) if use_hint else [],
+                list(h[attack_idx].coeff) if use_hint else [],
                 B, C, tau * eta,
                 p_bit_error, n_bits,
+                use_hint
             )
         bp.add_trace(c, x_priors)
     print(f"  collected {bp.trace_count()} traces  [{time.perf_counter()-t_start:.1f}s]")
@@ -189,7 +189,7 @@ def run_attack(
     # rec     = count_recovered(est, correct_secret, lp)
     # elapsed = time.perf_counter() - t_start
     return ok, rec, n, elapsed
-
+    
 
 @click.command()
 @click.option("--p-bit-error", default=0.0,  show_default=True, type=float, help="Bit-flip error rate for observations.")
@@ -197,33 +197,37 @@ def run_attack(
 @click.option("--num-iter",    default=50,    show_default=True, type=int,   help="Maximum BP iterations.")
 @click.option("--damping",     default=0.0,   show_default=True, type=float, help="Message damping factor (0=none, 0.5=recommended for t0-unknown).")
 @click.option("--t0-known",    is_flag=True,  default=False,                 help="Use t0-known mode (default: t0-unknown).")
-def main(p_bit_error, num_traces, num_iter, damping, t0_known):
+@click.option("--use-hint",    is_flag=True,  default=False,                 help="Use hint-bit constraint (default: no).")
+@click.option("--traceset",    default=0,     type=int,                      help="Number of traceset")
+def main(p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, traceset):
     n, eta, tau = 256, 2, 39
     t0_is_known = t0_known
 
     if t0_is_known:
-        trace_file = "traces_t0_known_100.pkl"
+        trace_file = f"traces/t0_known/traces_t0_known_1000_{traceset}.pkl"
     else:
-        trace_file = "traces_t0_unknown_100.pkl"
+        trace_file = f"traces/t0_unknown/traces_t0_unknown_1000_{traceset}.pkl"
 
     list_traces = []
     with open(trace_file, "rb") as f:
         t0 = pickle.load(f)
         s2 = pickle.load(f)
-        for _ in range(100):
+        for i in range(num_traces):
             w0 = pickle.load(f)
             c  = pickle.load(f)
             xD = pickle.load(f)
-            Azct1_low = pickle.load(f)
-            h = pickle.load(f)
-            list_traces.append((w0, c, xD, Azct1_low, h))
+            if t0_is_known == False:
+                Azct1_low = pickle.load(f)
+                h = pickle.load(f)
+                list_traces.append((w0, c, xD, Azct1_low, h))
+            else:
+                list_traces.append((w0, c, xD, None, None))
 
     label = f"ML-DSA-44 n={n} ({'t0-known' if t0_is_known else 't0-unknown'})"
-    print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, p_bit_error={p_bit_error}, damping={damping}) ===")
+    print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, p_bit_error={p_bit_error}, damping={damping}, use_hint={use_hint}) ===")
     ok, rec, n_, elapsed = run_attack(
         n, eta, tau, p_bit_error, list_traces, s2, w0, t0,
-        num_traces=num_traces, num_iterations=num_iter,
-        t0_is_known=t0_is_known, damping=damping,
+        num_iterations=num_iter,t0_is_known=t0_is_known, damping=damping, use_hint=use_hint
     )
     print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")
 

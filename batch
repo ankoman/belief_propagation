@@ -1,0 +1,12 @@
+#!/bin/bash
+
+Mr=25
+p=0.874
+for p in 0.1 0.2 0.3 0.4 0.45, 0.46, 0.47, 0.48; do
+    for traces in 10 20 40 60 80 100 200 400 600 800 1000; do
+        mkdir "res/${p}_${traces}"
+        for traceset in $(seq 0 1 9); do
+            python3 -u ./examples/w0_attack.py --t0-known --num-traces $traces --p-bit-error $p --num-iter 50 --damping 0.5 --traceset $traceset > "res/${p}_${traces}/${traceset}.out"
+        done 
+    done
+done
