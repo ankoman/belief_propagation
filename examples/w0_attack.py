@@ -74,24 +74,24 @@ def flip_bits_nbit(x, p_bit_error, n_bits):
 def hw(x):
     return bin(x).count("1")
 
-def gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, B, C, beta, p_bit_error, n_bits, USE_HINT = False) -> Dict[int, float]:
+def gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, p_bit_error, n_bits, USE_HINT = False) -> Dict[int, float]:
     if USE_HINT:
         x_min_t = -999999999
         x_max_t =  999999999
         if h_i == 0:
-            x_min_t = -beta - B - Azct1_low_i
-            x_max_t =  beta + B - Azct1_low_i
+            x_min_t = -beta - U - Azct1_low_i
+            x_max_t =  beta + U - Azct1_low_i
         elif Azct1_low_i > 0:
-            x_min_t = -beta + C - Azct1_low_i
+            x_min_t = -beta + V - Azct1_low_i
         else:
-            x_max_t = beta - C - Azct1_low_i
+            x_max_t = beta - V - Azct1_low_i
 
         x_min = max(x_min, x_min_t)
         x_max = min(x_max, x_max_t) 
 
     dict_t = {}
     for x_est in range(x_min, x_max + 1):
-        e = w0_obs ^ (xD_i + x_est)
+        e = w0_obs ^ (x_est + xD_i)
         hd = hw(e & ((1 << n_bits) - 1))
         dict_t[x_est] = (1-p_bit_error)**hd
     return dict_t
@@ -134,8 +134,8 @@ def run_attack(
     x_max =  tau * s_max
     p_unif = 1.0 / (s_max - s_min + 1)
     bp.set_prior([{v: p_unif for v in range(s_min, s_max + 1)} for _ in range(n)])
-    B = 95232 - tau*eta - 1
-    C = 95232 + tau*eta + 1
+    U = 95232 - tau*eta - 1
+    V = 95232 + tau*eta + 1
 
     # Phase 1: add traces with noisy observations
     for w0, c, xD, Azct1_low, h in list_traces:
@@ -148,9 +148,9 @@ def run_attack(
         #         x_priors.append({w0_true_i - xD_i: 1.0}) 
         #     else:
         #         w0_obs = flip_bits_nbit(w0_true_i, p_bit_error, n_bits)
-        #         dict_t = gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, B, C, tau*eta, p_bit_error, n_bits)
+        #         dict_t = gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, tau*eta, p_bit_error, n_bits)
         #         x_priors.append(dict_t)
-        ### Parallel version
+        ## Parallel version
         if p_bit_error == 0.0:
             x_priors = [{w0_true_i - xD_i: 1.0} for w0_true_i, xD_i in zip(w0[attack_idx], xD[attack_idx])]
         else:
@@ -161,7 +161,7 @@ def run_attack(
                 x_min, x_max,
                 list(Azct1_low[attack_idx].coeff) if use_hint else [],
                 list(h[attack_idx].coeff) if use_hint else [],
-                B, C, tau * eta,
+                U, V, tau * eta,
                 p_bit_error, n_bits,
                 use_hint
             )
@@ -221,7 +221,7 @@ def main(p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, tracese
                 h = pickle.load(f)
                 list_traces.append((w0, c, xD, Azct1_low, h))
             else:
-                list_traces.append((w0, c, xD, None, None))
+                list_traces.append((w0, c, xD, xD, xD))
 
     label = f"ML-DSA-44 n={n} ({'t0-known' if t0_is_known else 't0-unknown'})"
     print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, p_bit_error={p_bit_error}, damping={damping}, use_hint={use_hint}) ===")
