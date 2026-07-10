@@ -13,6 +13,10 @@ except ImportError:
         "belief_propagation not found – run `maturin develop` inside .venv first."
     )
 
+q = 8380417
+SHARES = 4
+DELTA = 44
+RHO = 25
 class polyRing:
     q = 8380417
     n = 256
@@ -74,7 +78,7 @@ def flip_bits_nbit(x, p_bit_error, n_bits):
 def hw(x):
     return bin(x).count("1")
 
-def gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, p_bit_error, n_bits, USE_HINT = False) -> Dict[int, float]:
+def gen_x_priors(w1, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, p_bit_error, n_bits, USE_HINT = False) -> Dict[int, float]:
     if USE_HINT:
         x_min_t = -999999999
         x_max_t =  999999999
@@ -90,11 +94,41 @@ def gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, p_bit
         x_max = min(x_max, x_max_t) 
 
     dict_t = {}
-    for x_est in range(x_min, x_max + 1):
-        e = w0_obs ^ (x_est + xD_i)
-        hd = hw(e & ((1 << n_bits) - 1))
-        dict_t[x_est] = (1-p_bit_error)**hd
+    for w0 in range(x_min + xD_i, x_max + xD_i + 1):
+        est_chi = math.floor((w0*DELTA-w1)*2**RHO/q+2**(RHO-1))
+        hd = hw(est_chi ^ obs_chi)
+        dict_t[w0 - xD_i] = (1-p_bit_error)**hd
     return dict_t
+
+def obs_SecDecomposeComp(w):
+    w = w + q if w < 0 else w
+    x = make_share(w, q)
+    z = []
+    switchedmod = (DELTA << RHO)
+    for i in range(SHARES):
+        z.append((x[i]*DELTA*2**RHO)//q % switchedmod)
+    z[0] = (z[0] + SHARES-1 + 2**(RHO-1)) % switchedmod
+
+    z = unmask(z, switchedmod)
+
+    ### zの下位RHOビットが漏れる
+    obs = z & (2**RHO-1)
+
+    return obs
+
+def make_share(x, mod):
+    y = [x]
+    for i in range(SHARES-1):
+        r = random.randint(0, q-1)
+        y.append(r)
+        y[0] = (y[0] - r) % mod
+    return y
+
+def unmask(share, mod):
+    x = 0
+    for i in range(SHARES):
+        x += share[i]
+    return x % mod
 
 def run_attack(
     n: int,
@@ -122,13 +156,11 @@ def run_attack(
         s_min = -eta
         s_max =  eta
         correct_secret = s2[attack_idx]
-        n_bits = 8
     else:
         s_min = -4098
         s_max = 4097
         correct_secret = s2[attack_idx] - t0[attack_idx]
         correct_secret.mod_pm()
-        n_bits = 18
 
     x_min =  tau * s_min
     x_max =  tau * s_max
@@ -138,31 +170,33 @@ def run_attack(
     V = 95232 + tau*eta + 1
 
     # Phase 1: add traces with noisy observations
-    for w0, c, xD, Azct1_low, h in list_traces:
+    for w, w1, w0, c, xD, Azct1_low, h in list_traces:
         c.mod_pm()
         xD[attack_idx].mod_pm()
         x_priors = []
         # ### Serial version                                                                             
-        # for w0_true_i, xD_i, Azct1_low_i, h_i in zip(w0[attack_idx], xD[attack_idx], Azct1_low[attack_idx], h[attack_idx]):
+        # for w_i, w1_i, w0_true_i, xD_i, Azct1_low_i, h_i in zip(w[attack_idx], w1[attack_idx], w0[attack_idx], xD[attack_idx], Azct1_low[attack_idx], h[attack_idx]):
+        #     chi = obs_SecDecomposeComp(w_i)
         #     if p_bit_error == 0.0:
         #         x_priors.append({w0_true_i - xD_i: 1.0}) 
         #     else:
-        #         w0_obs = flip_bits_nbit(w0_true_i, p_bit_error, n_bits)
-        #         dict_t = gen_x_priors(w0_obs, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, tau*eta, p_bit_error, n_bits)
+        #         obs_chi = flip_bits_nbit(chi, p_bit_error, RHO)
+        #         dict_t = gen_x_priors(w1_i, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, tau*eta, p_bit_error, RHO)
         #         x_priors.append(dict_t)
         ## Parallel version
         if p_bit_error == 0.0:
             x_priors = [{w0_true_i - xD_i: 1.0} for w0_true_i, xD_i in zip(w0[attack_idx], xD[attack_idx])]
         else:
-            w0_obs_list = [flip_bits_nbit(w0_true_i, p_bit_error, n_bits) for w0_true_i in w0[attack_idx].coeff]
+            obs_chi_list = [flip_bits_nbit(obs_SecDecomposeComp(w_i), p_bit_error, RHO) for w_i in w[attack_idx].coeff]
             x_priors = gen_x_priors_parallel(
-                w0_obs_list,
+                list(w1[attack_idx].coeff),
+                obs_chi_list,
                 list(xD[attack_idx].coeff),
                 x_min, x_max,
                 list(Azct1_low[attack_idx].coeff) if use_hint else [],
                 list(h[attack_idx].coeff) if use_hint else [],
                 U, V, tau * eta,
-                p_bit_error, n_bits,
+                p_bit_error,
                 use_hint
             )
         bp.add_trace(c, x_priors)
@@ -213,15 +247,17 @@ def main(p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, tracese
         t0 = pickle.load(f)
         s2 = pickle.load(f)
         for i in range(num_traces):
+            w = pickle.load(f)
+            w1 = pickle.load(f)
             w0 = pickle.load(f)
             c  = pickle.load(f)
             xD = pickle.load(f)
             if t0_is_known == False:
                 Azct1_low = pickle.load(f)
                 h = pickle.load(f)
-                list_traces.append((w0, c, xD, Azct1_low, h))
+                list_traces.append((w, w1, w0, c, xD, Azct1_low, h))
             else:
-                list_traces.append((w0, c, xD, xD, xD))
+                list_traces.append((w, w1, w0, c, xD, xD, xD))
 
     label = f"ML-DSA-44 n={n} ({'t0-known' if t0_is_known else 't0-unknown'})"
     print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, p_bit_error={p_bit_error}, damping={damping}, use_hint={use_hint}) ===")

@@ -346,8 +346,13 @@ impl PyBPGraph {
 
 /// Compute x_priors for all n polynomial coefficients in parallel.
 ///
-/// For each coefficient i a likelihood dict is built:
-///   `(1 - p_bit_error) ** popcount((w0_obs[i] XOR (xd[i] + x_est)) & mask)`
+/// Mirrors the Python `gen_x_priors` (RHO-bit masked-decomposition leakage
+/// model): for each coefficient i and each candidate `w0` in
+/// `[x_min + xd[i], x_max + xd[i]]`,
+///
+///   est_chi = floor((w0*DELTA - w1[i]) * 2**RHO / q + 2**(RHO-1))
+///   hd      = popcount(abs(est_chi XOR obs_chi[i]))
+///   dict_t[w0 - xd[i]] = (1 - p_bit_error) ** hd
 ///
 /// When `use_hint` is true the effective x range is first narrowed by the
 /// ML-DSA hint-bit constraint (mirrors the Python `gen_x_priors` USE_HINT):
@@ -356,10 +361,11 @@ impl PyBPGraph {
 ///   h_i == 1, azct1[i] ≤ 0  →  x_est ≤  beta - C - azct1[i]
 /// The result is further clipped to [x_min, x_max].
 #[pyfunction]
-#[pyo3(signature = (w0_obs_list, xd_list, x_min, x_max, azct1_low_list, h_list, b, c, beta, p_bit_error, n_bits, use_hint=false))]
+#[pyo3(signature = (w1_list, obs_chi_list, xd_list, x_min, x_max, azct1_low_list, h_list, b, c, beta, p_bit_error, use_hint=false))]
 pub fn gen_x_priors_parallel(
     py: Python<'_>,
-    w0_obs_list: Vec<i32>,
+    w1_list: Vec<i64>,
+    obs_chi_list: Vec<i64>,
     xd_list: Vec<i32>,
     x_min: i32,
     x_max: i32,
@@ -369,24 +375,25 @@ pub fn gen_x_priors_parallel(
     c: i32,
     beta: i32,
     p_bit_error: f64,
-    n_bits: u32,
     use_hint: bool,
 ) -> PyResult<Vec<HashMap<i32, f64>>> {
-    let n = w0_obs_list.len();
-    // if xd_list.len() != n || azct1_low_list.len() != n || h_list.len() != n {
-    //     return Err(pyo3::exceptions::PyValueError::new_err(
-    //         "w0_obs_list, xd_list, azct1_low_list, and h_list must all have the same length",
-    //     ));
-    // }
-    let mask = (1i32 << n_bits) - 1;
+    const DELTA: i64 = 44;
+    const RHO: u32 = 25;
+    const Q: i64 = 8_380_417;
+
+    let two_rho: i64 = 1i64 << RHO;
+    let half_rho: f64 = (1i64 << (RHO - 1)) as f64;
+
+    let n = w1_list.len();
     let base = 1.0_f64 - p_bit_error;
 
     let result = py.allow_threads(|| {
         (0..n)
             .into_par_iter()
             .map(|i| {
-                let w0_obs = w0_obs_list[i];
-                let xd_i   = xd_list[i];
+                let w1 = w1_list[i];
+                let obs_chi = obs_chi_list[i];
+                let xd_i = xd_list[i] as i64;
 
                 let (eff_min, eff_max) = if use_hint {
                     let azct1  = azct1_low_list[i];
@@ -404,10 +411,15 @@ pub fn gen_x_priors_parallel(
                     (x_min, x_max)
                 };
 
-                (eff_min..=eff_max)
-                    .map(|x_est| {
-                        let hd = (w0_obs ^ (xd_i + x_est)) & mask;
-                        (x_est, base.powi(hd.count_ones() as i32))
+                let w0_lo = eff_min as i64 + xd_i;
+                let w0_hi = eff_max as i64 + xd_i;
+
+                (w0_lo..=w0_hi)
+                    .map(|w0| {
+                        let numer = (w0 * DELTA - w1) * two_rho;
+                        let est_chi = ((numer as f64) / (Q as f64) + half_rho).floor() as i64;
+                        let hd = (est_chi ^ obs_chi).unsigned_abs().count_ones();
+                        ((w0 - xd_i) as i32, base.powi(hd as i32))
                     })
                     .collect::<HashMap<i32, f64>>()
             })
