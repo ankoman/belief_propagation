@@ -385,7 +385,8 @@ pub fn gen_x_priors_parallel(
     let half_rho: f64 = (1i64 << (RHO - 1)) as f64;
 
     let n = w1_list.len();
-    let base = 1.0_f64 - p_bit_error;
+    //let base = 1.0_f64 - p_bit_error;
+    let base = p_bit_error*(1.0_f64 - p_bit_error);
 
     let result = py.allow_threads(|| {
         (0..n)

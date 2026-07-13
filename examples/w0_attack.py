@@ -97,7 +97,7 @@ def gen_x_priors(w1, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, 
     for w0 in range(x_min + xD_i, x_max + xD_i + 1):
         est_chi = math.floor((w0*DELTA-w1)*2**RHO/q+2**(RHO-1))
         hd = hw(est_chi ^ obs_chi)
-        dict_t[w0 - xD_i] = (1-p_bit_error)**hd
+        dict_t[w0 - xD_i] = (p_bit_error*(1-p_bit_error))**hd
     return dict_t
 
 def obs_SecDecomposeComp(w):
