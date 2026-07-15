@@ -157,8 +157,8 @@ def run_attack(
         s_max =  eta
         correct_secret = s2[attack_idx]
     else:
-        s_min = -4098
-        s_max = 4097
+        s_min = -4097
+        s_max = 4098
         correct_secret = s2[attack_idx] - t0[attack_idx]
         correct_secret.mod_pm()
 
