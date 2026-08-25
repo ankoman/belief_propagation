@@ -187,9 +187,14 @@ def run_attack(
         ## Parallel version
         if p_bit_error == 0.0:
             x_priors = [{w0_true_i - xD_i: 1.0} for w0_true_i, xD_i in zip(w0[attack_idx], xD[attack_idx])]
+            bp.add_trace(list(c.coeff), x_priors)
         else:
+            # Fused path: compute x_priors directly inside Rust and store them
+            # without ever materialising a Python dict (avoids a large transient
+            # allocation per trace).
             obs_chi_list = [flip_bits_nbit(obs_SecDecomposeComp(w_i), p_bit_error, RHO) for w_i in w[attack_idx].coeff]
-            x_priors = gen_x_priors_parallel(
+            bp.add_trace_from_leakage(
+                list(c.coeff),
                 list(w1[attack_idx].coeff),
                 obs_chi_list,
                 list(xD[attack_idx].coeff),
@@ -200,7 +205,6 @@ def run_attack(
                 p_bit_error,
                 use_hint
             )
-        bp.add_trace(c, x_priors)
     print(f"  collected {bp.trace_count()} traces  [{time.perf_counter()-t_start:.1f}s]")
 
     # Phase 2: iterate BP

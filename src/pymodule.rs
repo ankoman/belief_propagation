@@ -344,6 +344,74 @@ impl PyBPGraph {
 // Parallel gen_x_priors
 // -----------------------------------------------------------------------
 
+/// Leakage-model constants (RHO-bit masked-decomposition, ML-DSA-44).
+pub(crate) const XPRIOR_DELTA: i64 = 44;
+pub(crate) const XPRIOR_RHO: u32 = 25;
+pub(crate) const XPRIOR_Q: i64 = 8_380_417;
+
+/// Compute the x_prior distribution for a single coefficient as a dense,
+/// contiguous range `[offset, offset + data.len())`.
+///
+/// This is the single source of truth for the leakage model shared by both
+/// `gen_x_priors_parallel` (which boxes the result into a Python dict) and
+/// `MLDsaBP::add_trace_from_leakage` (which keeps it as a dense Rust buffer,
+/// avoiding the Python-dict round trip entirely).
+///
+/// `base` is the per-Hamming-distance weight `p*(1-p)`; the returned
+/// probability for each candidate `w0` is `base.powi(hd)`.  Keys are
+/// `w0 - xd_i`, so the returned `offset` equals the effective lower bound on
+/// the secret value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_x_prior_dense(
+    w1: i64,
+    obs_chi: i64,
+    xd_i: i64,
+    x_min: i32,
+    x_max: i32,
+    azct1: i32,
+    h_i: i32,
+    b: i32,
+    c: i32,
+    beta: i32,
+    base: f64,
+    use_hint: bool,
+) -> (i32, Vec<f64>) {
+    let two_rho: i64 = 1i64 << XPRIOR_RHO;
+    let half_rho: f64 = (1i64 << (XPRIOR_RHO - 1)) as f64;
+
+    let (eff_min, eff_max) = if use_hint {
+        // Hint-bit range constraint.
+        let (hint_min, hint_max) = if h_i == 0 {
+            (-beta - b - azct1, beta + b - azct1)
+        } else if azct1 > 0 {
+            (-beta + c - azct1, i32::MAX)
+        } else {
+            (i32::MIN, beta - c - azct1)
+        };
+        (x_min.max(hint_min), x_max.min(hint_max))
+    } else {
+        (x_min, x_max)
+    };
+
+    if eff_min > eff_max {
+        return (eff_min, Vec::new());
+    }
+
+    let w0_lo = eff_min as i64 + xd_i;
+    let w0_hi = eff_max as i64 + xd_i;
+
+    let data: Vec<f64> = (w0_lo..=w0_hi)
+        .map(|w0| {
+            let numer = (w0 * XPRIOR_DELTA - w1) * two_rho;
+            let est_chi = ((numer as f64) / (XPRIOR_Q as f64) + half_rho).floor() as i64;
+            let hd = ((est_chi ^ obs_chi).unsigned_abs() >> 2).count_ones();
+            base.powi(hd as i32)
+        })
+        .collect();
+
+    (eff_min, data)
+}
+
 /// Compute x_priors for all n polynomial coefficients in parallel.
 ///
 /// Mirrors the Python `gen_x_priors` (RHO-bit masked-decomposition leakage
@@ -377,13 +445,6 @@ pub fn gen_x_priors_parallel(
     p_bit_error: f64,
     use_hint: bool,
 ) -> PyResult<Vec<HashMap<i32, f64>>> {
-    const DELTA: i64 = 44;
-    const RHO: u32 = 25;
-    const Q: i64 = 8_380_417;
-
-    let two_rho: i64 = 1i64 << RHO;
-    let half_rho: f64 = (1i64 << (RHO - 1)) as f64;
-
     let n = w1_list.len();
     //let base = 1.0_f64 - p_bit_error;
     let base = p_bit_error*(1.0_f64 - p_bit_error);
@@ -392,36 +453,15 @@ pub fn gen_x_priors_parallel(
         (0..n)
             .into_par_iter()
             .map(|i| {
-                let w1 = w1_list[i];
-                let obs_chi = obs_chi_list[i];
-                let xd_i = xd_list[i] as i64;
-
-                let (eff_min, eff_max) = if use_hint {
-                    let azct1  = azct1_low_list[i];
-                    let h_i    = h_list[i];
-                    // Hint-bit range constraint.
-                    let (hint_min, hint_max) = if h_i == 0 {
-                        (-beta - b - azct1, beta + b - azct1)
-                    } else if azct1 > 0 {
-                        (-beta + c - azct1, i32::MAX)
-                    } else {
-                        (i32::MIN, beta - c - azct1)
-                    };
-                    (x_min.max(hint_min), x_max.min(hint_max))
-                } else {
-                    (x_min, x_max)
-                };
-
-                let w0_lo = eff_min as i64 + xd_i;
-                let w0_hi = eff_max as i64 + xd_i;
-
-                (w0_lo..=w0_hi)
-                    .map(|w0| {
-                        let numer = (w0 * DELTA - w1) * two_rho;
-                        let est_chi = ((numer as f64) / (Q as f64) + half_rho).floor() as i64;
-                        let hd = ((est_chi ^ obs_chi).unsigned_abs()>>2).count_ones();
-                        ((w0 - xd_i) as i32, base.powi(hd as i32))
-                    })
+                let azct1 = if use_hint { azct1_low_list[i] } else { 0 };
+                let h_i   = if use_hint { h_list[i] } else { 0 };
+                let (offset, data) = compute_x_prior_dense(
+                    w1_list[i], obs_chi_list[i], xd_list[i] as i64,
+                    x_min, x_max, azct1, h_i, b, c, beta, base, use_hint,
+                );
+                data.into_iter()
+                    .enumerate()
+                    .map(|(k, p)| (offset + k as i32, p))
                     .collect::<HashMap<i32, f64>>()
             })
             .collect::<Vec<_>>()

@@ -4,6 +4,8 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::pymodule::compute_x_prior_dense;
+
 type Complex64 = Complex<f64>;
 
 thread_local! {
@@ -34,7 +36,7 @@ fn get_nonzero_for_output(c: &[i32], i: usize) -> Vec<(usize, i32)> {
 // -----------------------------------------------------------------------
 
 #[derive(Clone)]
-struct DenseMsg {
+pub(crate) struct DenseMsg {
     offset: i32,
     data: Vec<f64>,
 }
@@ -42,6 +44,13 @@ struct DenseMsg {
 impl DenseMsg {
     fn delta(v: i32) -> Self {
         DenseMsg { offset: v, data: vec![1.0] }
+    }
+
+    // Build directly from a dense, contiguous range without going through a
+    // HashMap.  Used by add_trace_from_leakage to skip the Python-dict round
+    // trip.
+    pub(crate) fn from_dense(offset: i32, data: Vec<f64>) -> Self {
+        DenseMsg { offset, data }
     }
 
     // Only nonzero entries determine the dense range, so sparse priors
@@ -235,7 +244,7 @@ fn compute_messages(
 
 struct Trace {
     challenge: Vec<i32>,
-    x_priors: Vec<Msg>,
+    x_priors: Vec<DenseMsg>,
 }
 
 // -----------------------------------------------------------------------
@@ -292,7 +301,7 @@ fn compute_contributions(
             let t = c_nz.len();
             if t == 0 { return vec![]; }
 
-            let msg_x = DenseMsg::from_sparse(&trace.x_priors[i]);
+            let msg_x = trace.x_priors[i].clone();
 
             let prev_msgs_i: &[(usize, Vec<(i32, f64)>)] =
                 if i < prev_msgs.len() { &prev_msgs[i] } else { &[] };
@@ -412,6 +421,10 @@ impl MLDsaBP {
     }
 
     /// Store a trace (challenge + measurement priors). Does not compute anything.
+    ///
+    /// `x_priors` is converted to a dense, offset-based representation once
+    /// here rather than on every `run_iteration` call, since it was
+    /// previously being rebuilt from the HashMap on every BP iteration.
     pub fn add_trace(
         &mut self,
         challenge: Vec<i32>,
@@ -422,6 +435,74 @@ impl MLDsaBP {
                 "challenge and x_priors must have length n",
             ));
         }
+        let x_priors: Vec<DenseMsg> = x_priors.iter().map(DenseMsg::from_sparse).collect();
+        self.traces.push(Trace { challenge, x_priors });
+        self.prev_factor_msgs.push(Vec::new());
+        Ok(())
+    }
+
+    /// Store a trace by computing the leakage-model x_priors directly in Rust.
+    ///
+    /// This fuses `gen_x_priors_parallel` + `add_trace`: the per-coefficient
+    /// distributions are built straight into the dense internal representation
+    /// without ever materialising a Python dict, avoiding a large transient
+    /// allocation (n × range boxed int/float pairs per trace) and the
+    /// subsequent dict→HashMap→DenseMsg round trip.
+    ///
+    /// Arguments mirror `gen_x_priors_parallel`, plus `challenge`.
+    #[pyo3(signature = (
+        challenge, w1_list, obs_chi_list, xd_list, x_min, x_max,
+        azct1_low_list, h_list, b, c, beta, p_bit_error, use_hint=false
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_trace_from_leakage(
+        &mut self,
+        py: Python<'_>,
+        challenge: Vec<i32>,
+        w1_list: Vec<i64>,
+        obs_chi_list: Vec<i64>,
+        xd_list: Vec<i32>,
+        x_min: i32,
+        x_max: i32,
+        azct1_low_list: Vec<i32>,
+        h_list: Vec<i32>,
+        b: i32,
+        c: i32,
+        beta: i32,
+        p_bit_error: f64,
+        use_hint: bool,
+    ) -> PyResult<()> {
+        let n = self.n;
+        if challenge.len() != n || w1_list.len() != n || obs_chi_list.len() != n
+            || xd_list.len() != n
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "challenge, w1_list, obs_chi_list and xd_list must have length n",
+            ));
+        }
+        if use_hint && (azct1_low_list.len() != n || h_list.len() != n) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "azct1_low_list and h_list must have length n when use_hint is set",
+            ));
+        }
+
+        let base = p_bit_error * (1.0_f64 - p_bit_error);
+
+        let x_priors: Vec<DenseMsg> = py.allow_threads(|| {
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let azct1 = if use_hint { azct1_low_list[i] } else { 0 };
+                    let h_i   = if use_hint { h_list[i] } else { 0 };
+                    let (offset, data) = compute_x_prior_dense(
+                        w1_list[i], obs_chi_list[i], xd_list[i] as i64,
+                        x_min, x_max, azct1, h_i, b, c, beta, base, use_hint,
+                    );
+                    DenseMsg::from_dense(offset, data)
+                })
+                .collect()
+        });
+
         self.traces.push(Trace { challenge, x_priors });
         self.prev_factor_msgs.push(Vec::new());
         Ok(())
