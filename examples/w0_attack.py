@@ -16,6 +16,7 @@ except ImportError:
 q = 8380417
 SHARES = 4
 DELTA = 44
+GAMMA_2 = (q-1)/(2*DELTA)
 RHO = 25
 class polyRing:
     q = 8380417
@@ -166,8 +167,8 @@ def run_attack(
     x_max =  tau * s_max
     p_unif = 1.0 / (s_max - s_min + 1)
     bp.set_prior([{v: p_unif for v in range(s_min, s_max + 1)} for _ in range(n)])
-    U = 95232 - tau*eta - 1
-    V = 95232 + tau*eta + 1
+    U = GAMMA_2 - tau*eta - 1
+    V = GAMMA_2 + tau*eta + 1
 
     # Phase 1: add traces with noisy observations
     for w, w1, w0, c, xD, Azct1_low, h in list_traces:

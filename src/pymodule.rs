@@ -419,7 +419,7 @@ pub fn gen_x_priors_parallel(
                     .map(|w0| {
                         let numer = (w0 * DELTA - w1) * two_rho;
                         let est_chi = ((numer as f64) / (Q as f64) + half_rho).floor() as i64;
-                        let hd = (est_chi ^ obs_chi).unsigned_abs().count_ones();
+                        let hd = ((est_chi ^ obs_chi).unsigned_abs()>>2).count_ones();
                         ((w0 - xd_i) as i32, base.powi(hd as i32))
                     })
                     .collect::<HashMap<i32, f64>>()
