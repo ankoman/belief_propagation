@@ -16,7 +16,7 @@ except ImportError:
 q = 8380417
 SHARES = 4
 DELTA = 44
-GAMMA_2 = (q-1)/(2*DELTA)
+GAMMA_2 = (q-1)//(2*DELTA)
 RHO = 25
 class polyRing:
     q = 8380417
