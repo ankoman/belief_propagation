@@ -357,10 +357,19 @@ pub(crate) const XPRIOR_Q: i64 = 8_380_417;
 /// `MLDsaBP::add_trace_from_leakage` (which keeps it as a dense Rust buffer,
 /// avoiding the Python-dict round trip entirely).
 ///
-/// `base` is the per-Hamming-distance weight `p*(1-p)`; the returned
-/// probability for each candidate `w0` is `base.powi(hd)`.  Keys are
-/// `w0 - xd_i`, so the returned `offset` equals the effective lower bound on
-/// the secret value.
+/// `bit_weights[j]` is the per-bit weight `p*(1-p)` for the leaked chi bit that
+/// ends up at shifted position `j` after the `>> 2` drop, i.e. raw chi bit
+/// `j + 2` (candidate A: the two lowest chi bits are ignored, so `bit_weights`
+/// has length `RHO - 2`).  For each candidate `w0` the probability is the
+/// product of `bit_weights[j]` over every bit `j` where the leaked and observed
+/// chi differ; uniform weights reproduce the old `base.powi(hd)` exactly.
+///
+/// chi is an unsigned RHO-bit value by definition, so any `est_chi` outside
+/// `[0, 2^RHO)` cannot correspond to a real observation and is assigned
+/// probability 0 (this also removes the 2^RHO aliasing of the old model).
+///
+/// Keys are `w0 - xd_i`, so the returned `offset` equals the effective lower
+/// bound on the secret value.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_x_prior_dense(
     w1: i64,
@@ -373,7 +382,7 @@ pub(crate) fn compute_x_prior_dense(
     b: i32,
     c: i32,
     beta: i32,
-    base: f64,
+    bit_weights: &[f64],
     use_hint: bool,
 ) -> (i32, Vec<f64>) {
     let two_rho: i64 = 1i64 << XPRIOR_RHO;
@@ -404,8 +413,22 @@ pub(crate) fn compute_x_prior_dense(
         .map(|w0| {
             let numer = (w0 * XPRIOR_DELTA - w1) * two_rho;
             let est_chi = ((numer as f64) / (XPRIOR_Q as f64) + half_rho).floor() as i64;
-            let hd = ((est_chi ^ obs_chi).unsigned_abs() >> 2).count_ones();
-            base.powi(hd as i32)
+            // chi is unsigned RHO-bit: est_chi outside [0, 2^RHO) → probability 0.
+            if est_chi < 0 || est_chi >= two_rho {
+                0.0
+            } else {
+                // Weighted Hamming distance over the leaked bits: drop the low 2
+                // bits (>> 2), then multiply the per-bit weight of every bit that
+                // differs between the estimated and observed chi.
+                let mut diff = ((est_chi ^ obs_chi) >> 2) as u64;
+                let mut w = 1.0_f64;
+                while diff != 0 {
+                    let j = diff.trailing_zeros() as usize;
+                    w *= bit_weights[j];
+                    diff &= diff - 1;
+                }
+                w
+            }
         })
         .collect();
 
@@ -446,8 +469,10 @@ pub fn gen_x_priors_parallel(
     use_hint: bool,
 ) -> PyResult<Vec<HashMap<i32, f64>>> {
     let n = w1_list.len();
-    //let base = 1.0_f64 - p_bit_error;
-    let base = p_bit_error*(1.0_f64 - p_bit_error);
+    // Uniform per-bit weight: every leaked chi bit shares the same p*(1-p),
+    // which reproduces the old base.powi(hd) behavior via compute_x_prior_dense.
+    let base = p_bit_error * (1.0_f64 - p_bit_error);
+    let bit_weights = vec![base; (XPRIOR_RHO as usize) - 2];
 
     let result = py.allow_threads(|| {
         (0..n)
@@ -457,7 +482,7 @@ pub fn gen_x_priors_parallel(
                 let h_i   = if use_hint { h_list[i] } else { 0 };
                 let (offset, data) = compute_x_prior_dense(
                     w1_list[i], obs_chi_list[i], xd_list[i] as i64,
-                    x_min, x_max, azct1, h_i, b, c, beta, base, use_hint,
+                    x_min, x_max, azct1, h_i, b, c, beta, &bit_weights, use_hint,
                 );
                 data.into_iter()
                     .enumerate()

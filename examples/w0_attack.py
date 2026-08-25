@@ -18,6 +18,12 @@ SHARES = 4
 DELTA = 44
 GAMMA_2 = (q-1)//(2*DELTA)
 RHO = 25
+
+p_kc = [0.563, 0.604, 0.55, 0.617, 0.55, 0.614, 0.558, 0.616, 0.56, 0.622, 0.561, 0.629, 0.55, 0.634, 0.563, 0.645, 0.571, 0.645, 0.572, 0.642, 0.574, 0.648, 0.57, 0.663, 0.556]
+p_dl = [0.69, 0.71, 0.628, 0.71, 0.626, 0.715, 0.627, 0.71, 0.632, 0.718, 0.633, 0.724, 0.635, 0.739, 0.636, 0.735, 0.641, 0.75, 0.649, 0.756, 0.662, 0.773, 0.67, 0.798, 0.785]
+p_kc = [1-x for x in p_kc]
+p_dl = [1-x for x in p_dl]
+
 class polyRing:
     q = 8380417
     n = 256
@@ -69,17 +75,23 @@ class polyRing:
             if self.coeff[i] > self.q // 2:
                 self.coeff[i] -= self.q
 
-def flip_bits_nbit(x, p_bit_error, n_bits):
+def flip_bits_nbit(x, p_list, n_bits):
     y = x & ((1 << n_bits) - 1)  # nbitに制限
     for i in range(n_bits):
-        if random.random() < p_bit_error:
+        if random.random() < p_list[i]:
             y ^= (1 << i)
     return y
     
 def hw(x):
     return bin(x).count("1")
 
-def gen_x_priors(w1, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, p_bit_error, n_bits, USE_HINT = False) -> Dict[int, float]:
+def gen_x_priors(w1, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, p_list, n_bits, USE_HINT = False) -> Dict[int, float]:
+    # Reference implementation of the leakage model (the production path uses the
+    # fused Rust compute_x_prior_dense). p_list holds the per-bit error rates
+    # (RHO values). chi is unsigned RHO-bit, so any est_chi outside [0, 2^RHO)
+    # gets probability 0. The two lowest chi bits are dropped (>>2, candidate A:
+    # shifted bit j maps to raw chi bit j+2), and each differing bit multiplies
+    # its per-bit weight p*(1-p).
     if USE_HINT:
         x_min_t = -999999999
         x_max_t =  999999999
@@ -92,13 +104,24 @@ def gen_x_priors(w1, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, 
             x_max_t = beta - V - Azct1_low_i
 
         x_min = max(x_min, x_min_t)
-        x_max = min(x_max, x_max_t) 
+        x_max = min(x_max, x_max_t)
 
+    two_rho = 1 << RHO
     dict_t = {}
     for w0 in range(x_min + xD_i, x_max + xD_i + 1):
         est_chi = math.floor((w0*DELTA-w1)*2**RHO/q+2**(RHO-1))
-        hd = hw(est_chi ^ obs_chi)
-        dict_t[w0 - xD_i] = (p_bit_error*(1-p_bit_error))**hd
+        if est_chi < 0 or est_chi >= two_rho:
+            dict_t[w0 - xD_i] = 0.0
+            continue
+        diff = (est_chi ^ obs_chi) >> 2
+        weight = 1.0
+        j = 0
+        while diff:
+            if diff & 1:
+                weight *= p_list[j + 2] * (1 - p_list[j + 2])
+            diff >>= 1
+            j += 1
+        dict_t[w0 - xD_i] = weight
     return dict_t
 
 def obs_SecDecomposeComp(w):
@@ -170,6 +193,16 @@ def run_attack(
     U = GAMMA_2 - tau*eta - 1
     V = GAMMA_2 + tau*eta + 1
 
+    # Resolve per-bit error rates (a list of RHO values) used both to inject the
+    # observation noise and to build the Rust likelihood. The two sentinels pick
+    # the measured per-bit rates; a float means a uniform rate on every bit.
+    if p_bit_error == "USE_P_KC":
+        p_list = list(p_kc)
+    elif p_bit_error == "USE_P_DL":
+        p_list = list(p_dl)
+    else:
+        p_list = [float(p_bit_error)] * RHO
+
     # Phase 1: add traces with noisy observations
     for w, w1, w0, c, xD, Azct1_low, h in list_traces:
         c.mod_pm()
@@ -192,7 +225,7 @@ def run_attack(
             # Fused path: compute x_priors directly inside Rust and store them
             # without ever materialising a Python dict (avoids a large transient
             # allocation per trace).
-            obs_chi_list = [flip_bits_nbit(obs_SecDecomposeComp(w_i), p_bit_error, RHO) for w_i in w[attack_idx].coeff]
+            obs_chi_list = [flip_bits_nbit(obs_SecDecomposeComp(w_i), p_list, RHO) for w_i in w[attack_idx].coeff]
             bp.add_trace_from_leakage(
                 list(c.coeff),
                 list(w1[attack_idx].coeff),
@@ -202,7 +235,7 @@ def run_attack(
                 list(Azct1_low[attack_idx].coeff) if use_hint else [],
                 list(h[attack_idx].coeff) if use_hint else [],
                 U, V, tau * eta,
-                p_bit_error,
+                p_list,
                 use_hint
             )
     print(f"  collected {bp.trace_count()} traces  [{time.perf_counter()-t_start:.1f}s]")
@@ -231,7 +264,7 @@ def run_attack(
     
 
 @click.command()
-@click.option("--p-bit-error", default=0.0,  show_default=True, type=float, help="Bit-flip error rate for observations.")
+@click.option("--p-bit-error", default="0.0", show_default=True, type=str, help="Bit-flip error rate for observations. Pass 'USE_P_KC' or 'USE_P_DL' to use the per-bit measured error rates, or a float for a uniform rate.")
 @click.option("--num-traces",  default=50,    show_default=True, type=int,   help="Number of traces to use.")
 @click.option("--num-iter",    default=50,    show_default=True, type=int,   help="Maximum BP iterations.")
 @click.option("--damping",     default=0.0,   show_default=True, type=float, help="Message damping factor (0=none, 0.5=recommended for t0-unknown).")
@@ -241,6 +274,12 @@ def run_attack(
 def main(p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, traceset):
     n, eta, tau = 256, 2, 39
     t0_is_known = t0_known
+
+    # Resolve --p-bit-error: the two sentinels select the per-bit measured error
+    # rates (a list of RHO values, one per chi bit); anything else is a uniform
+    # float rate applied to all bits (previous behavior).
+    if not p_bit_error in ["USE_P_KC", "USE_P_DL"]:
+        p_bit_error = float(p_bit_error)
 
     if t0_is_known:
         trace_file = f"traces/t0_known/traces_t0_known_1000_{traceset}.pkl"

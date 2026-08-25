@@ -4,7 +4,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::pymodule::compute_x_prior_dense;
+use crate::pymodule::{compute_x_prior_dense, XPRIOR_RHO};
 
 type Complex64 = Complex<f64>;
 
@@ -453,7 +453,7 @@ impl MLDsaBP {
     /// Arguments mirror `gen_x_priors_parallel`, plus `challenge`.
     #[pyo3(signature = (
         challenge, w1_list, obs_chi_list, xd_list, x_min, x_max,
-        azct1_low_list, h_list, b, c, beta, p_bit_error, use_hint=false
+        azct1_low_list, h_list, b, c, beta, p_list, use_hint=false
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_trace_from_leakage(
@@ -470,7 +470,7 @@ impl MLDsaBP {
         b: i32,
         c: i32,
         beta: i32,
-        p_bit_error: f64,
+        p_list: Vec<f64>,
         use_hint: bool,
     ) -> PyResult<()> {
         let n = self.n;
@@ -486,8 +486,18 @@ impl MLDsaBP {
                 "azct1_low_list and h_list must have length n when use_hint is set",
             ));
         }
+        let rho = XPRIOR_RHO as usize;
+        if p_list.len() != rho {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "p_list must have length RHO ({rho}), got {}",
+                p_list.len()
+            )));
+        }
 
-        let base = p_bit_error * (1.0_f64 - p_bit_error);
+        // Per-bit weights for the leaked chi bits kept after the >>2 drop
+        // (candidate A: shifted bit j corresponds to raw chi bit j+2).
+        let bit_weights: Vec<f64> =
+            (2..rho).map(|i| p_list[i] * (1.0_f64 - p_list[i])).collect();
 
         let x_priors: Vec<DenseMsg> = py.allow_threads(|| {
             (0..n)
@@ -497,7 +507,7 @@ impl MLDsaBP {
                     let h_i   = if use_hint { h_list[i] } else { 0 };
                     let (offset, data) = compute_x_prior_dense(
                         w1_list[i], obs_chi_list[i], xd_list[i] as i64,
-                        x_min, x_max, azct1, h_i, b, c, beta, base, use_hint,
+                        x_min, x_max, azct1, h_i, b, c, beta, &bit_weights, use_hint,
                     );
                     DenseMsg::from_dense(offset, data)
                 })
