@@ -15,7 +15,10 @@ thread_local! {
 const FFT_THRESHOLD: usize = 65_536;
 
 type Msg = HashMap<i32, f64>;
-type FactorMsgs = Vec<Vec<(usize, Vec<(i32, f64)>)>>;
+// Factor→variable messages. The innermost Vec<f64> is a dense log-probability
+// vector over the secret range: entry `idx` corresponds to secret value
+// `s_min + idx`, so the redundant i32 key is not stored.
+type FactorMsgs = Vec<Vec<(usize, Vec<f64>)>>;
 
 fn challenge_weight(c: &[i32], i: usize, j: usize) -> i32 {
     let n = c.len();
@@ -182,13 +185,15 @@ fn dot_clipped(a: &[f64], b: &[f64], b_start: i32) -> f64 {
     a_sl.iter().zip(b_sl).map(|(&x, &y)| x * y).sum()
 }
 
+// Returns a dense log-probability vector over `s_min..=s_max`; entry `idx`
+// corresponds to secret value `s_min + idx`.
 fn compute_messages(
     left: &DenseMsg,
     rx: &DenseMsg,
     s_min: i32,
     s_max: i32,
     ck: i32,
-) -> Vec<(i32, f64)> {
+) -> Vec<f64> {
     let b_base = left.offset - rx.offset;
     let n_cav = (s_max - s_min + 1) as usize;
 
@@ -222,8 +227,7 @@ fn compute_messages(
                     } else {
                         0.0
                     };
-                    let lp = if sum > 0.0 { sum.ln() } else { -1e300_f64 };
-                    (sv, lp)
+                    if sum > 0.0 { sum.ln() } else { -1e300_f64 }
                 })
                 .collect()
         })
@@ -231,8 +235,7 @@ fn compute_messages(
         (s_min..=s_max)
             .map(|sv| {
                 let sum = dot_clipped(&left.data, &rx.data, b_base + ck * sv);
-                let lp = if sum > 0.0 { sum.ln() } else { -1e300_f64 };
-                (sv, lp)
+                if sum > 0.0 { sum.ln() } else { -1e300_f64 }
             })
             .collect()
     }
@@ -253,20 +256,18 @@ struct Trace {
 
 fn cavity_belief_dense(
     log_key_probs_j: &Msg,
-    prev_msg: Option<&[(i32, f64)]>,
+    prev_msg: Option<&[f64]>,
     s_min: i32,
     s_max: i32,
 ) -> Vec<f64> {
     let n_vals = (s_max - s_min + 1) as usize;
-    // Build a map for O(1) prev-message lookup (important when range is wide).
-    let prev_map: HashMap<i32, f64> = prev_msg
-        .map(|p| p.iter().copied().collect())
-        .unwrap_or_default();
-
+    // prev_msg is a dense vector aligned to s_min..=s_max, so it is indexed
+    // directly (idx = sv - s_min) instead of via a HashMap lookup.
     let log_vals: Vec<f64> = (s_min..=s_max)
-        .map(|sv| {
+        .enumerate()
+        .map(|(idx, sv)| {
             let lp = log_key_probs_j.get(&sv).copied().unwrap_or(f64::NEG_INFINITY);
-            let pm = prev_map.get(&sv).copied().unwrap_or(0.0);
+            let pm = prev_msg.and_then(|p| p.get(idx)).copied().unwrap_or(0.0);
             lp - pm
         })
         .collect();
@@ -303,7 +304,7 @@ fn compute_contributions(
 
             let msg_x = trace.x_priors[i].clone();
 
-            let prev_msgs_i: &[(usize, Vec<(i32, f64)>)] =
+            let prev_msgs_i: &[(usize, Vec<f64>)] =
                 if i < prev_msgs.len() { &prev_msgs[i] } else { &[] };
 
             let cav_beliefs: Vec<Vec<f64>> = c_nz
@@ -326,7 +327,7 @@ fn compute_contributions(
 
             // Backward pass: rx = RX_k, starts at msg_x.
             let mut rx = msg_x;
-            let mut messages: Vec<(usize, Vec<(i32, f64)>)> =
+            let mut messages: Vec<(usize, Vec<f64>)> =
                 (0..t).map(|_| (0, vec![])).collect();
 
             for k in (0..t).rev() {
@@ -547,8 +548,8 @@ impl MLDsaBP {
                             Some((_, d)) => d,
                             None => continue,
                         };
-                        for (idx, (_, new_lp)) in new_deltas.iter_mut().enumerate() {
-                            if let Some((_, prev_lp)) = prev_deltas.get(idx) {
+                        for (idx, new_lp) in new_deltas.iter_mut().enumerate() {
+                            if let Some(prev_lp) = prev_deltas.get(idx) {
                                 let a = log_new_w  + *new_lp;
                                 let b = log_prev_w + *prev_lp;
                                 let m = a.max(b);
@@ -564,8 +565,10 @@ impl MLDsaBP {
         for contribs in &new_factor_msgs {
             for i_contribs in contribs {
                 for (j, deltas) in i_contribs {
-                    for (sv, delta) in deltas {
-                        if let Some(lp) = new_log_key_probs[*j].get_mut(sv) {
+                    // deltas[idx] is the log-message for secret value s_min + idx.
+                    for (idx, delta) in deltas.iter().enumerate() {
+                        let sv = s_min + idx as i32;
+                        if let Some(lp) = new_log_key_probs[*j].get_mut(&sv) {
                             *lp += delta;
                         }
                     }
