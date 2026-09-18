@@ -451,9 +451,12 @@ impl MLDsaBP {
     /// subsequent dict→HashMap→DenseMsg round trip.
     ///
     /// Arguments mirror `gen_x_priors_parallel`, plus `challenge`.
+    /// `delta` is the level-dependent `(q-1)/(2*gamma_2)` (44 for ML-DSA-44,
+    /// 16 for ML-DSA-65/87) and must match the value used to produce
+    /// `obs_chi_list`.
     #[pyo3(signature = (
         challenge, w1_list, obs_chi_list, xd_list, x_min, x_max,
-        azct1_low_list, h_list, b, c, beta, p_list, use_hint=false
+        azct1_low_list, h_list, b, c, beta, delta, p_list, use_hint=false
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_trace_from_leakage(
@@ -470,6 +473,7 @@ impl MLDsaBP {
         b: i32,
         c: i32,
         beta: i32,
+        delta: i64,
         p_list: Vec<f64>,
         use_hint: bool,
     ) -> PyResult<()> {
@@ -507,7 +511,7 @@ impl MLDsaBP {
                     let h_i   = if use_hint { h_list[i] } else { 0 };
                     let (offset, data) = compute_x_prior_dense(
                         w1_list[i], obs_chi_list[i], xd_list[i] as i64,
-                        x_min, x_max, azct1, h_i, b, c, beta, &bit_weights, use_hint,
+                        x_min, x_max, azct1, h_i, b, c, beta, delta, &bit_weights, use_hint,
                     );
                     DenseMsg::from_dense(offset, data)
                 })

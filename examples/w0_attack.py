@@ -15,8 +15,10 @@ except ImportError:
 
 q = 8380417
 SHARES = 4
-DELTA = 44
-GAMMA_2 = (q-1)//(2*DELTA)
+ETA = None
+TAU = None
+DELTA = None
+GAMMA_2 = None
 RHO = 25
 
 p_kc = [0.563, 0.604, 0.55, 0.617, 0.55, 0.614, 0.558, 0.616, 0.56, 0.622, 0.561, 0.629, 0.55, 0.634, 0.563, 0.645, 0.571, 0.645, 0.572, 0.642, 0.574, 0.648, 0.57, 0.663, 0.556]
@@ -155,9 +157,6 @@ def unmask(share, mod):
     return x % mod
 
 def run_attack(
-    n: int,
-    eta: int,
-    tau: int,
     p_bit_error: float,
     list_traces,
     s2,
@@ -169,29 +168,31 @@ def run_attack(
     damping = 0.0,
     use_hint: bool = False,
 ) -> Tuple[float, float]:
-
+    n = 256
     rng = random.Random(seed)
     attack_idx = 0
     t_start = time.perf_counter()
-    bp = MLDsaBP(n, eta)
+    bp = MLDsaBP(n, ETA)
     bp.set_damping(damping)  # loopy BP stabilization for wide secret range. 0 is no effect
 
     if t0_is_known:
-        s_min = -eta
-        s_max =  eta
+        s_min = -ETA
+        s_max =  ETA
         correct_secret = s2[attack_idx]
     else:
-        s_min = -4097
-        s_max = 4098
+        # s = s2 - t0 with t0 = t mod± 2^13 ∈ [-2^12, 2^12-1], so the range
+        # depends on eta and must not stay hardwired to the eta=2 values.
+        s_min = -(ETA + 4095)
+        s_max =   ETA + 4096
         correct_secret = s2[attack_idx] - t0[attack_idx]
         correct_secret.mod_pm()
 
-    x_min =  tau * s_min
-    x_max =  tau * s_max
+    x_min =  TAU * s_min
+    x_max =  TAU * s_max
     p_unif = 1.0 / (s_max - s_min + 1)
     bp.set_prior([{v: p_unif for v in range(s_min, s_max + 1)} for _ in range(n)])
-    U = GAMMA_2 - tau*eta - 1
-    V = GAMMA_2 + tau*eta + 1
+    U = GAMMA_2 - TAU*ETA - 1
+    V = GAMMA_2 + TAU*ETA + 1
 
     # Resolve per-bit error rates (a list of RHO values) used both to inject the
     # observation noise and to build the Rust likelihood. The two sentinels pick
@@ -234,7 +235,7 @@ def run_attack(
                 x_min, x_max,
                 list(Azct1_low[attack_idx].coeff) if use_hint else [],
                 list(h[attack_idx].coeff) if use_hint else [],
-                U, V, tau * eta,
+                U, V, TAU * ETA, DELTA,
                 p_list,
                 use_hint
             )
@@ -264,6 +265,7 @@ def run_attack(
     
 
 @click.command()
+@click.option("--level",       default=2,     type=int,                      help="Security category in [2,3,5]")
 @click.option("--p-bit-error", default="0.0", show_default=True, type=str, help="Bit-flip error rate for observations. Pass 'USE_P_KC' or 'USE_P_DL' to use the per-bit measured error rates, or a float for a uniform rate.")
 @click.option("--num-traces",  default=50,    show_default=True, type=int,   help="Number of traces to use.")
 @click.option("--num-iter",    default=50,    show_default=True, type=int,   help="Maximum BP iterations.")
@@ -271,9 +273,26 @@ def run_attack(
 @click.option("--t0-known",    is_flag=True,  default=False,                 help="Use t0-known mode (default: t0-unknown).")
 @click.option("--use-hint",    is_flag=True,  default=False,                 help="Use hint-bit constraint (default: no).")
 @click.option("--traceset",    default=0,     type=int,                      help="Number of traceset")
-def main(p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, traceset):
-    n, eta, tau = 256, 2, 39
-    t0_is_known = t0_known
+def main(level, p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, traceset):
+    global ETA, TAU, DELTA, GAMMA_2
+    if level == 2:
+        ETA = 2
+        TAU = 39
+        DELTA = 44
+        GAMMA_2 = (q-1)//(2*DELTA)
+    elif level == 3:
+        ETA = 4
+        TAU = 49
+        DELTA = 16
+        GAMMA_2 = (q-1)//(2*DELTA)
+    elif level == 5:
+        ETA = 2
+        TAU = 60
+        DELTA = 16
+        GAMMA_2 = (q-1)//(2*DELTA)
+    else:
+        print("Security level not defined")
+        exit(-1)
 
     # Resolve --p-bit-error: the two sentinels select the per-bit measured error
     # rates (a list of RHO values, one per chi bit); anything else is a uniform
@@ -281,10 +300,10 @@ def main(p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, tracese
     if not p_bit_error in ["USE_P_KC", "USE_P_DL"]:
         p_bit_error = float(p_bit_error)
 
-    if t0_is_known:
-        trace_file = f"traces/t0_known/traces_t0_known_1000_{traceset}.pkl"
+    if t0_known:
+        trace_file = f"traces/t0_known/traces_level{level}_t0_known_1000_{traceset}.pkl"
     else:
-        trace_file = f"traces/t0_unknown/traces_t0_unknown_1000_{traceset}.pkl"
+        trace_file = f"traces/t0_unknown/traces_level{level}_t0_unknown_1000_{traceset}.pkl"
 
     list_traces = []
     with open(trace_file, "rb") as f:
@@ -296,18 +315,18 @@ def main(p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, tracese
             w0 = pickle.load(f)
             c  = pickle.load(f)
             xD = pickle.load(f)
-            if t0_is_known == False:
+            if t0_known == False:
                 Azct1_low = pickle.load(f)
                 h = pickle.load(f)
                 list_traces.append((w, w1, w0, c, xD, Azct1_low, h))
             else:
                 list_traces.append((w, w1, w0, c, xD, xD, xD))
 
-    label = f"ML-DSA-44 n={n} ({'t0-known' if t0_is_known else 't0-unknown'})"
-    print(f"\n=== {label}  (eta={eta}, tau={tau}, traces={num_traces}, p_bit_error={p_bit_error}, damping={damping}, use_hint={use_hint}) ===")
+    label = f"ML-DSA level {level} ({'t0-known' if t0_known else 't0-unknown'})"
+    print(f"\n=== {label}  (eta={ETA}, tau={TAU}, traces={num_traces}, p_bit_error={p_bit_error}, damping={damping}, use_hint={use_hint}) ===")
     ok, rec, n_, elapsed = run_attack(
-        n, eta, tau, p_bit_error, list_traces, s2, w0, t0,
-        num_iterations=num_iter,t0_is_known=t0_is_known, damping=damping, use_hint=use_hint
+        p_bit_error, list_traces, s2, w0, t0,
+        num_iterations=num_iter,t0_is_known=t0_known, damping=damping, use_hint=use_hint
     )
     print(f"  => correct={ok}/{n_} ({100*ok/n_:.1f}%)  recovered={rec}/{n_}  total {elapsed:.1f}s")
 

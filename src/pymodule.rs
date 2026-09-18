@@ -344,8 +344,13 @@ impl PyBPGraph {
 // Parallel gen_x_priors
 // -----------------------------------------------------------------------
 
-/// Leakage-model constants (RHO-bit masked-decomposition, ML-DSA-44).
-pub(crate) const XPRIOR_DELTA: i64 = 44;
+/// Leakage-model constants (RHO-bit masked decomposition).
+///
+/// `DELTA = (q-1) / (2*gamma_2)` is **security-level dependent** (44 for
+/// ML-DSA-44, 16 for ML-DSA-65/87), so it is passed in per call rather than
+/// baked in here; only the value used by ML-DSA-44 is kept as a default for
+/// the legacy `gen_x_priors_parallel` entry point.
+pub(crate) const XPRIOR_DELTA_L2: i64 = 44;
 pub(crate) const XPRIOR_RHO: u32 = 25;
 pub(crate) const XPRIOR_Q: i64 = 8_380_417;
 
@@ -356,6 +361,11 @@ pub(crate) const XPRIOR_Q: i64 = 8_380_417;
 /// `gen_x_priors_parallel` (which boxes the result into a Python dict) and
 /// `MLDsaBP::add_trace_from_leakage` (which keeps it as a dense Rust buffer,
 /// avoiding the Python-dict round trip entirely).
+///
+/// `delta` is `(q-1) / (2*gamma_2)` for the targeted security level (44 for
+/// ML-DSA-44, 16 for ML-DSA-65/87).  It must match the value the observations
+/// were produced with, otherwise `est_chi` is meaningless and most candidates
+/// fall outside `[0, 2^RHO)` and get probability 0.
 ///
 /// `bit_weights[j]` is the per-bit weight `p*(1-p)` for the leaked chi bit that
 /// ends up at shifted position `j` after the `>> 2` drop, i.e. raw chi bit
@@ -382,6 +392,7 @@ pub(crate) fn compute_x_prior_dense(
     b: i32,
     c: i32,
     beta: i32,
+    delta: i64,
     bit_weights: &[f64],
     use_hint: bool,
 ) -> (i32, Vec<f64>) {
@@ -411,7 +422,7 @@ pub(crate) fn compute_x_prior_dense(
 
     let data: Vec<f64> = (w0_lo..=w0_hi)
         .map(|w0| {
-            let numer = (w0 * XPRIOR_DELTA - w1) * two_rho;
+            let numer = (w0 * delta - w1) * two_rho;
             let est_chi = ((numer as f64) / (XPRIOR_Q as f64) + half_rho).floor() as i64;
             // chi is unsigned RHO-bit: est_chi outside [0, 2^RHO) → probability 0.
             if est_chi < 0 || est_chi >= two_rho {
@@ -452,7 +463,7 @@ pub(crate) fn compute_x_prior_dense(
 ///   h_i == 1, azct1[i] ≤ 0  →  x_est ≤  beta - C - azct1[i]
 /// The result is further clipped to [x_min, x_max].
 #[pyfunction]
-#[pyo3(signature = (w1_list, obs_chi_list, xd_list, x_min, x_max, azct1_low_list, h_list, b, c, beta, p_bit_error, use_hint=false))]
+#[pyo3(signature = (w1_list, obs_chi_list, xd_list, x_min, x_max, azct1_low_list, h_list, b, c, beta, p_bit_error, use_hint=false, delta=XPRIOR_DELTA_L2))]
 pub fn gen_x_priors_parallel(
     py: Python<'_>,
     w1_list: Vec<i64>,
@@ -467,6 +478,7 @@ pub fn gen_x_priors_parallel(
     beta: i32,
     p_bit_error: f64,
     use_hint: bool,
+    delta: i64,
 ) -> PyResult<Vec<HashMap<i32, f64>>> {
     let n = w1_list.len();
     // Uniform per-bit weight: every leaked chi bit shares the same p*(1-p),
@@ -482,7 +494,7 @@ pub fn gen_x_priors_parallel(
                 let h_i   = if use_hint { h_list[i] } else { 0 };
                 let (offset, data) = compute_x_prior_dense(
                     w1_list[i], obs_chi_list[i], xd_list[i] as i64,
-                    x_min, x_max, azct1, h_i, b, c, beta, &bit_weights, use_hint,
+                    x_min, x_max, azct1, h_i, b, c, beta, delta, &bit_weights, use_hint,
                 );
                 data.into_iter()
                     .enumerate()
