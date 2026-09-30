@@ -265,14 +265,14 @@ def run_attack(
     
 
 @click.command()
-@click.option("--level",       default=2,     type=int,                      help="Security category in [2,3,5]")
-@click.option("--p-bit-error", default="0.0", show_default=True, type=str, help="Bit-flip error rate for observations. Pass 'USE_P_KC' or 'USE_P_DL' to use the per-bit measured error rates, or a float for a uniform rate.")
-@click.option("--num-traces",  default=50,    show_default=True, type=int,   help="Number of traces to use.")
-@click.option("--num-iter",    default=50,    show_default=True, type=int,   help="Maximum BP iterations.")
-@click.option("--damping",     default=0.0,   show_default=True, type=float, help="Message damping factor (0=none, 0.5=recommended for t0-unknown).")
+@click.option("--level",       "-l", default=2,     type=int,                      help="Security category in [2,3,5]")
+@click.option("--p-bit-error", "-p", default="0.0", show_default=True, type=str, help="Bit-flip error rate for observations. Pass 'USE_P_KC' or 'USE_P_DL' to use the per-bit measured error rates, or a float for a uniform rate.")
+@click.option("--num-traces",  "-n", default=50,    show_default=True, type=int,   help="Number of traces to use.")
+@click.option("--num-iter",    "-i", default=50,    show_default=True, type=int,   help="Maximum BP iterations.")
+@click.option("--damping",     "-d", default=0.0,   show_default=True, type=float, help="Message damping factor (0=none, 0.5=recommended for t0-unknown).")
 @click.option("--t0-known",    is_flag=True,  default=False,                 help="Use t0-known mode (default: t0-unknown).")
 @click.option("--use-hint",    is_flag=True,  default=False,                 help="Use hint-bit constraint (default: no).")
-@click.option("--traceset",    default=0,     type=int,                      help="Number of traceset")
+@click.option("--traceset",    "-s", default=0,     type=int,                      help="Number of traceset")
 def main(level, p_bit_error, num_traces, num_iter, damping, t0_known, use_hint, traceset):
     global ETA, TAU, DELTA, GAMMA_2
     if level == 2:
