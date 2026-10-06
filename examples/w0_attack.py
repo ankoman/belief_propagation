@@ -4,6 +4,7 @@ import time
 import sys, pickle
 import numpy as np
 import click
+from statistics import NormalDist
 from typing import Dict, List, Tuple
 from ml_dsa_attack import count_recovered
 try:
@@ -92,39 +93,70 @@ def hard_to_soft(obs_chi, p_list):
     # error rates p_list: q_i = 1 - p_i if the observed bit is 1, else p_i.
     return [1 - p_list[i] if (obs_chi >> i) & 1 else p_list[i] for i in range(RHO)]
 
-def gen_x_priors(w1, q_bits, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, USE_HINT = False) -> Dict[int, float]:
-    # Reference implementation of the leakage model (the production path uses the
-    # fused Rust compute_x_prior_dense). q_bits holds the soft observation
-    # q_i = P(chi[i]=1 | L) of each chi bit (RHO values). chi is unsigned RHO-bit,
-    # so any est_chi outside [0, 2^RHO) gets probability 0. The two lowest chi
-    # bits are ignored; every informative bit i contributes q_i if est_chi[i] = 1
-    # and 1 - q_i otherwise.
-    if USE_HINT:
-        x_min_t = -999999999
-        x_max_t =  999999999
-        if h_i == 0:
-            x_min_t = -beta - U - Azct1_low_i
-            x_max_t =  beta + U - Azct1_low_i
-        elif Azct1_low_i > 0:
-            x_min_t = -beta + V - Azct1_low_i
-        else:
-            x_max_t = beta - V - Azct1_low_i
+def noise_sigmas(p_list):
+    # Per-bit Gaussian noise std for the soft-decision leakage L = b + N(0, sigma^2)
+    # (means 0/1, equal variance). With equiprobable bits Var(E[L|b]) = 1/4 and
+    # E[Var(L|b)] = sigma^2, so SNR = 1/(4 sigma^2); equating it with
+    # SNR = [Phi^-1(acc)]^2, acc = 1 - p_list[i], gives sigma = 1/(2 Phi^-1(acc)).
+    # acc >= 1 means noiseless (sigma = 0); acc <= 0.5 carries no information
+    # (sigma = inf).
+    sigmas = []
+    for p in p_list:
+        acc = 1 - p
+        sigmas.append(1 / (2 * NormalDist().inv_cdf(acc)))
+    return sigmas
 
-        x_min = max(x_min, x_min_t)
-        x_max = min(x_max, x_max_t)
+def leak_soft_chi(chi, sigmas):
+    # Soft-decision leakage of chi: each bit b leaks L = b + N(0, sigma_i^2). The
+    # attacker knows the true leakage distribution (L | b ~ N(b, sigma_i^2)) and
+    # the uniform bit prior, so the posterior is
+    #   q_i = P(chi[i]=1 | L) = N(L; 1, sigma^2) / (N(L; 0, sigma^2) + N(L; 1, sigma^2)),
+    # evaluated from the log-likelihoods to avoid underflow of the pdfs.
+    q_bits = []
+    for i in range(RHO):
+        b = (chi >> i) & 1
+        sigma = sigmas[i]
 
-    two_rho = 1 << RHO
-    dict_t = {}
-    for w0 in range(x_min + xD_i, x_max + xD_i + 1):
-        est_chi = math.floor((w0*DELTA-w1)*2**RHO/q+2**(RHO-1))
-        if est_chi < 0 or est_chi >= two_rho:
-            dict_t[w0 - xD_i] = 0.0
-            continue
-        weight = 1.0
-        for i in range(2, RHO):
-            weight *= q_bits[i] if (est_chi >> i) & 1 else 1 - q_bits[i]
-        dict_t[w0 - xD_i] = weight
-    return dict_t
+        L = b + random.gauss(0.0, sigma)
+        ll0 = -(L - 0.0)**2 / (2 * sigma**2)   # log N(L; 0, sigma^2) + const
+        ll1 = -(L - 1.0)**2 / (2 * sigma**2)   # log N(L; 1, sigma^2) + const
+        m = max(ll0, ll1)
+        q_bits.append(math.exp(ll1 - m) / (math.exp(ll0 - m) + math.exp(ll1 - m)))
+    return q_bits
+
+# def gen_x_priors(w1, q_bits, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, USE_HINT = False) -> Dict[int, float]:
+#     # Reference implementation of the leakage model (the production path uses the
+#     # fused Rust compute_x_prior_dense). q_bits holds the soft observation
+#     # q_i = P(chi[i]=1 | L) of each chi bit (RHO values). chi is unsigned RHO-bit,
+#     # so any est_chi outside [0, 2^RHO) gets probability 0. The two lowest chi
+#     # bits are ignored; every informative bit i contributes q_i if est_chi[i] = 1
+#     # and 1 - q_i otherwise.
+#     if USE_HINT:
+#         x_min_t = -999999999
+#         x_max_t =  999999999
+#         if h_i == 0:
+#             x_min_t = -beta - U - Azct1_low_i
+#             x_max_t =  beta + U - Azct1_low_i
+#         elif Azct1_low_i > 0:
+#             x_min_t = -beta + V - Azct1_low_i
+#         else:
+#             x_max_t = beta - V - Azct1_low_i
+
+#         x_min = max(x_min, x_min_t)
+#         x_max = min(x_max, x_max_t)
+
+#     two_rho = 1 << RHO
+#     dict_t = {}
+#     for w0 in range(x_min + xD_i, x_max + xD_i + 1):
+#         est_chi = math.floor((w0*DELTA-w1)*2**RHO/q+2**(RHO-1))
+#         if est_chi < 0 or est_chi >= two_rho:
+#             dict_t[w0 - xD_i] = 0.0
+#             continue
+#         weight = 1.0
+#         for i in range(2, RHO):
+#             weight *= q_bits[i] if (est_chi >> i) & 1 else 1 - q_bits[i]
+#         dict_t[w0 - xD_i] = weight
+#     return dict_t
 
 def obs_SecDecomposeComp(w):
     w = w + q if w < 0 else w
@@ -203,6 +235,7 @@ def run_attack(
         p_list = list(p_dl)
     else:
         p_list = [float(p_bit_error)] * RHO
+    sigmas = noise_sigmas(p_list)
 
     # Phase 1: add traces with noisy observations
     for w, w1, w0, c, xD, Azct1_low, h in list_traces:
@@ -226,8 +259,11 @@ def run_attack(
             # Fused path: compute x_priors directly inside Rust and store them
             # without ever materialising a Python dict (avoids a large transient
             # allocation per trace).
-            obs_chi_list = [flip_bits_nbit(obs_SecDecomposeComp(w_i), p_list, RHO) for w_i in w[attack_idx].coeff]
-            q_bits_list = [hard_to_soft(obs_chi, p_list) for obs_chi in obs_chi_list]
+            # Hard decision (equivalent to Eq. (hard2)):
+            # obs_chi_list = [flip_bits_nbit(obs_SecDecomposeComp(w_i), p_list, RHO) for w_i in w[attack_idx].coeff]
+            # q_bits_list = [hard_to_soft(obs_chi, p_list) for obs_chi in obs_chi_list]
+            # Soft decision: Gaussian leakage of each true chi bit -> posterior q_i.
+            q_bits_list = [leak_soft_chi(obs_SecDecomposeComp(w_i), sigmas) for w_i in w[attack_idx].coeff]
             bp.add_trace_from_leakage(
                 list(c.coeff),
                 list(w1[attack_idx].coeff),
