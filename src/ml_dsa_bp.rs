@@ -4,7 +4,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::pymodule::{compute_x_prior_dense, XPRIOR_RHO};
+use crate::pymodule::{check_q_bits_list, compute_x_prior_dense};
 
 type Complex64 = Complex<f64>;
 
@@ -452,11 +452,12 @@ impl MLDsaBP {
     ///
     /// Arguments mirror `gen_x_priors_parallel`, plus `challenge`.
     /// `delta` is the level-dependent `(q-1)/(2*gamma_2)` (44 for ML-DSA-44,
-    /// 16 for ML-DSA-65/87) and must match the value used to produce
-    /// `obs_chi_list`.
+    /// 16 for ML-DSA-65/87) and must match the value the leakage was produced
+    /// with.  `q_bits_list[i][b] = P(chi[b] = 1 | L)` is the soft observation of
+    /// chi bit `b` (length RHO) for coefficient `i`.
     #[pyo3(signature = (
-        challenge, w1_list, obs_chi_list, xd_list, x_min, x_max,
-        azct1_low_list, h_list, b, c, beta, delta, p_list, use_hint=false
+        challenge, w1_list, q_bits_list, xd_list, x_min, x_max,
+        azct1_low_list, h_list, b, c, beta, delta, use_hint=false
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_trace_from_leakage(
@@ -464,7 +465,7 @@ impl MLDsaBP {
         py: Python<'_>,
         challenge: Vec<i32>,
         w1_list: Vec<i64>,
-        obs_chi_list: Vec<i64>,
+        q_bits_list: Vec<Vec<f64>>,
         xd_list: Vec<i32>,
         x_min: i32,
         x_max: i32,
@@ -474,35 +475,20 @@ impl MLDsaBP {
         c: i32,
         beta: i32,
         delta: i64,
-        p_list: Vec<f64>,
         use_hint: bool,
     ) -> PyResult<()> {
         let n = self.n;
-        if challenge.len() != n || w1_list.len() != n || obs_chi_list.len() != n
-            || xd_list.len() != n
-        {
+        if challenge.len() != n || w1_list.len() != n || xd_list.len() != n {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "challenge, w1_list, obs_chi_list and xd_list must have length n",
+                "challenge, w1_list and xd_list must have length n",
             ));
         }
+        check_q_bits_list(&q_bits_list, n)?;
         if use_hint && (azct1_low_list.len() != n || h_list.len() != n) {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "azct1_low_list and h_list must have length n when use_hint is set",
             ));
         }
-        let rho = XPRIOR_RHO as usize;
-        if p_list.len() != rho {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "p_list must have length RHO ({rho}), got {}",
-                p_list.len()
-            )));
-        }
-
-        // Per-bit weights for the leaked chi bits kept after the >>2 drop
-        // (candidate A: shifted bit j corresponds to raw chi bit j+2).
-        let bit_weights: Vec<f64> =
-            (2..rho).map(|i| p_list[i] * (1.0_f64 - p_list[i])).collect();
-
         let x_priors: Vec<DenseMsg> = py.allow_threads(|| {
             (0..n)
                 .into_par_iter()
@@ -510,8 +496,8 @@ impl MLDsaBP {
                     let azct1 = if use_hint { azct1_low_list[i] } else { 0 };
                     let h_i   = if use_hint { h_list[i] } else { 0 };
                     let (offset, data) = compute_x_prior_dense(
-                        w1_list[i], obs_chi_list[i], xd_list[i] as i64,
-                        x_min, x_max, azct1, h_i, b, c, beta, delta, &bit_weights, use_hint,
+                        w1_list[i], &q_bits_list[i], xd_list[i] as i64,
+                        x_min, x_max, azct1, h_i, b, c, beta, delta, use_hint,
                     );
                     DenseMsg::from_dense(offset, data)
                 })

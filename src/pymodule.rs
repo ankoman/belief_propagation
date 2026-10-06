@@ -353,6 +353,36 @@ impl PyBPGraph {
 pub(crate) const XPRIOR_DELTA_L2: i64 = 44;
 pub(crate) const XPRIOR_RHO: u32 = 25;
 pub(crate) const XPRIOR_Q: i64 = 8_380_417;
+/// Number of low chi bits that vary within the preimage of a single `w0`,
+/// `floor(log2(2^RHO / q)) = 2`; only bits `[XPRIOR_DROP_BITS, RHO)` are
+/// informative.
+pub(crate) const XPRIOR_DROP_BITS: u32 = 2;
+
+/// Validate a list of soft chi-bit observations (one `RHO`-vector of
+/// `q_i = P(chi[i] = 1 | L)` per coefficient).
+pub(crate) fn check_q_bits_list(q_bits_list: &[Vec<f64>], n: usize) -> PyResult<()> {
+    let rho = XPRIOR_RHO as usize;
+    if q_bits_list.len() != n {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "q_bits_list must have length {n}, got {}",
+            q_bits_list.len()
+        )));
+    }
+    for (i, q_bits) in q_bits_list.iter().enumerate() {
+        if q_bits.len() != rho {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q_bits_list[{i}] must have length RHO ({rho}), got {}",
+                q_bits.len()
+            )));
+        }
+        if let Some(q) = q_bits.iter().find(|q| !(0.0..=1.0).contains(*q)) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "q_bits_list[{i}] contains {q}, which is not a probability in [0, 1]"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Compute the x_prior distribution for a single coefficient as a dense,
 /// contiguous range `[offset, offset + data.len())`.
@@ -367,12 +397,15 @@ pub(crate) const XPRIOR_Q: i64 = 8_380_417;
 /// were produced with, otherwise `est_chi` is meaningless and most candidates
 /// fall outside `[0, 2^RHO)` and get probability 0.
 ///
-/// `bit_weights[j]` is the per-bit weight `p*(1-p)` for the leaked chi bit that
-/// ends up at shifted position `j` after the `>> 2` drop, i.e. raw chi bit
-/// `j + 2` (candidate A: the two lowest chi bits are ignored, so `bit_weights`
-/// has length `RHO - 2`).  For each candidate `w0` the probability is the
-/// product of `bit_weights[j]` over every bit `j` where the leaked and observed
-/// chi differ; uniform weights reproduce the old `base.powi(hd)` exactly.
+/// Soft-label leakage model: `q_bits[i] = P(chi[i] = 1 | L)` is the classifier
+/// posterior of raw chi bit `i` (length `RHO`).  For each candidate `w0` with
+/// `est_chi = f^-1(w0)` the probability is
+///
+///   P(w0 | L) ∝ Π_{i ∈ I} q_i^{c_i} (1 - q_i)^{1 - c_i},   c_i = est_chi[i],
+///
+/// over the informative bits `I = [XPRIOR_DROP_BITS, RHO)`; `q_bits[0..2]` are
+/// ignored.  A hard observation `obs_chi` with per-bit error rate `e_i` is the
+/// special case `q_i = 1 - e_i` if `obs_chi[i] = 1` and `q_i = e_i` otherwise.
 ///
 /// chi is an unsigned RHO-bit value by definition, so any `est_chi` outside
 /// `[0, 2^RHO)` cannot correspond to a real observation and is assigned
@@ -383,7 +416,7 @@ pub(crate) const XPRIOR_Q: i64 = 8_380_417;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_x_prior_dense(
     w1: i64,
-    obs_chi: i64,
+    q_bits: &[f64],
     xd_i: i64,
     x_min: i32,
     x_max: i32,
@@ -393,7 +426,6 @@ pub(crate) fn compute_x_prior_dense(
     c: i32,
     beta: i32,
     delta: i64,
-    bit_weights: &[f64],
     use_hint: bool,
 ) -> (i32, Vec<f64>) {
     let two_rho: i64 = 1i64 << XPRIOR_RHO;
@@ -420,6 +452,24 @@ pub(crate) fn compute_x_prior_dense(
     let w0_lo = eff_min as i64 + xd_i;
     let w0_hi = eff_max as i64 + xd_i;
 
+    // The product over the informative bits is evaluated with byte-wise lookup
+    // tables: tables[k][v] = Π_{j<8} (v[j] ? q : 1-q) for informative bit 8k+j,
+    // so each candidate costs one lookup per byte instead of one multiply per bit.
+    let drop = XPRIOR_DROP_BITS as usize;
+    let n_bits = XPRIOR_RHO as usize - drop;
+    let tables: Vec<[f64; 256]> = (0..n_bits.div_ceil(8))
+        .map(|k| {
+            let mut table = [1.0_f64; 256];
+            for (v, entry) in table.iter_mut().enumerate() {
+                for j in 0..8.min(n_bits - 8 * k) {
+                    let q = q_bits[drop + 8 * k + j];
+                    *entry *= if (v >> j) & 1 == 1 { q } else { 1.0 - q };
+                }
+            }
+            table
+        })
+        .collect();
+
     let data: Vec<f64> = (w0_lo..=w0_hi)
         .map(|w0| {
             let numer = (w0 * delta - w1) * two_rho;
@@ -428,17 +478,12 @@ pub(crate) fn compute_x_prior_dense(
             if est_chi < 0 || est_chi >= two_rho {
                 0.0
             } else {
-                // Weighted Hamming distance over the leaked bits: drop the low 2
-                // bits (>> 2), then multiply the per-bit weight of every bit that
-                // differs between the estimated and observed chi.
-                let mut diff = ((est_chi ^ obs_chi) >> 2) as u64;
-                let mut w = 1.0_f64;
-                while diff != 0 {
-                    let j = diff.trailing_zeros() as usize;
-                    w *= bit_weights[j];
-                    diff &= diff - 1;
-                }
-                w
+                let c = (est_chi >> drop) as usize;
+                tables
+                    .iter()
+                    .enumerate()
+                    .map(|(k, table)| table[(c >> (8 * k)) & 0xff])
+                    .product()
             }
         })
         .collect();
@@ -453,8 +498,10 @@ pub(crate) fn compute_x_prior_dense(
 /// `[x_min + xd[i], x_max + xd[i]]`,
 ///
 ///   est_chi = floor((w0*DELTA - w1[i]) * 2**RHO / q + 2**(RHO-1))
-///   hd      = popcount(abs(est_chi XOR obs_chi[i]))
-///   dict_t[w0 - xd[i]] = (1 - p_bit_error) ** hd
+///   dict_t[w0 - xd[i]] = Π_{b=2}^{RHO-1} q[i][b]^{est_chi[b]} (1 - q[i][b])^{1 - est_chi[b]}
+///
+/// where `q_bits_list[i][b] = P(chi[b] = 1 | L)` is the soft observation of
+/// chi bit `b` for coefficient `i` (see `compute_x_prior_dense`).
 ///
 /// When `use_hint` is true the effective x range is first narrowed by the
 /// ML-DSA hint-bit constraint (mirrors the Python `gen_x_priors` USE_HINT):
@@ -463,11 +510,11 @@ pub(crate) fn compute_x_prior_dense(
 ///   h_i == 1, azct1[i] ≤ 0  →  x_est ≤  beta - C - azct1[i]
 /// The result is further clipped to [x_min, x_max].
 #[pyfunction]
-#[pyo3(signature = (w1_list, obs_chi_list, xd_list, x_min, x_max, azct1_low_list, h_list, b, c, beta, p_bit_error, use_hint=false, delta=XPRIOR_DELTA_L2))]
+#[pyo3(signature = (w1_list, q_bits_list, xd_list, x_min, x_max, azct1_low_list, h_list, b, c, beta, use_hint=false, delta=XPRIOR_DELTA_L2))]
 pub fn gen_x_priors_parallel(
     py: Python<'_>,
     w1_list: Vec<i64>,
-    obs_chi_list: Vec<i64>,
+    q_bits_list: Vec<Vec<f64>>,
     xd_list: Vec<i32>,
     x_min: i32,
     x_max: i32,
@@ -476,15 +523,11 @@ pub fn gen_x_priors_parallel(
     b: i32,
     c: i32,
     beta: i32,
-    p_bit_error: f64,
     use_hint: bool,
     delta: i64,
 ) -> PyResult<Vec<HashMap<i32, f64>>> {
     let n = w1_list.len();
-    // Uniform per-bit weight: every leaked chi bit shares the same p*(1-p),
-    // which reproduces the old base.powi(hd) behavior via compute_x_prior_dense.
-    let base = p_bit_error * (1.0_f64 - p_bit_error);
-    let bit_weights = vec![base; (XPRIOR_RHO as usize) - 2];
+    check_q_bits_list(&q_bits_list, n)?;
 
     let result = py.allow_threads(|| {
         (0..n)
@@ -493,8 +536,8 @@ pub fn gen_x_priors_parallel(
                 let azct1 = if use_hint { azct1_low_list[i] } else { 0 };
                 let h_i   = if use_hint { h_list[i] } else { 0 };
                 let (offset, data) = compute_x_prior_dense(
-                    w1_list[i], obs_chi_list[i], xd_list[i] as i64,
-                    x_min, x_max, azct1, h_i, b, c, beta, delta, &bit_weights, use_hint,
+                    w1_list[i], &q_bits_list[i], xd_list[i] as i64,
+                    x_min, x_max, azct1, h_i, b, c, beta, delta, use_hint,
                 );
                 data.into_iter()
                     .enumerate()

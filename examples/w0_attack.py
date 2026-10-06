@@ -87,13 +87,18 @@ def flip_bits_nbit(x, p_list, n_bits):
 def hw(x):
     return bin(x).count("1")
 
-def gen_x_priors(w1, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, p_list, n_bits, USE_HINT = False) -> Dict[int, float]:
+def hard_to_soft(obs_chi, p_list):
+    # Soft observation q_i = P(chi[i]=1 | L) of a hard-decision chi with per-bit
+    # error rates p_list: q_i = 1 - p_i if the observed bit is 1, else p_i.
+    return [1 - p_list[i] if (obs_chi >> i) & 1 else p_list[i] for i in range(RHO)]
+
+def gen_x_priors(w1, q_bits, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, USE_HINT = False) -> Dict[int, float]:
     # Reference implementation of the leakage model (the production path uses the
-    # fused Rust compute_x_prior_dense). p_list holds the per-bit error rates
-    # (RHO values). chi is unsigned RHO-bit, so any est_chi outside [0, 2^RHO)
-    # gets probability 0. The two lowest chi bits are dropped (>>2, candidate A:
-    # shifted bit j maps to raw chi bit j+2), and each differing bit multiplies
-    # its per-bit weight p*(1-p).
+    # fused Rust compute_x_prior_dense). q_bits holds the soft observation
+    # q_i = P(chi[i]=1 | L) of each chi bit (RHO values). chi is unsigned RHO-bit,
+    # so any est_chi outside [0, 2^RHO) gets probability 0. The two lowest chi
+    # bits are ignored; every informative bit i contributes q_i if est_chi[i] = 1
+    # and 1 - q_i otherwise.
     if USE_HINT:
         x_min_t = -999999999
         x_max_t =  999999999
@@ -115,14 +120,9 @@ def gen_x_priors(w1, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, beta, 
         if est_chi < 0 or est_chi >= two_rho:
             dict_t[w0 - xD_i] = 0.0
             continue
-        diff = (est_chi ^ obs_chi) >> 2
         weight = 1.0
-        j = 0
-        while diff:
-            if diff & 1:
-                weight *= p_list[j + 2] * (1 - p_list[j + 2])
-            diff >>= 1
-            j += 1
+        for i in range(2, RHO):
+            weight *= q_bits[i] if (est_chi >> i) & 1 else 1 - q_bits[i]
         dict_t[w0 - xD_i] = weight
     return dict_t
 
@@ -216,7 +216,7 @@ def run_attack(
         #         x_priors.append({w0_true_i - xD_i: 1.0}) 
         #     else:
         #         obs_chi = flip_bits_nbit(chi, p_bit_error, RHO)
-        #         dict_t = gen_x_priors(w1_i, obs_chi, xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, tau*eta, p_bit_error, RHO)
+        #         dict_t = gen_x_priors(w1_i, hard_to_soft(obs_chi, p_list), xD_i, x_min, x_max, Azct1_low_i, h_i, U, V, TAU*ETA, use_hint)
         #         x_priors.append(dict_t)
         ## Parallel version
         if p_bit_error == 0.0:
@@ -227,16 +227,16 @@ def run_attack(
             # without ever materialising a Python dict (avoids a large transient
             # allocation per trace).
             obs_chi_list = [flip_bits_nbit(obs_SecDecomposeComp(w_i), p_list, RHO) for w_i in w[attack_idx].coeff]
+            q_bits_list = [hard_to_soft(obs_chi, p_list) for obs_chi in obs_chi_list]
             bp.add_trace_from_leakage(
                 list(c.coeff),
                 list(w1[attack_idx].coeff),
-                obs_chi_list,
+                q_bits_list,
                 list(xD[attack_idx].coeff),
                 x_min, x_max,
                 list(Azct1_low[attack_idx].coeff) if use_hint else [],
                 list(h[attack_idx].coeff) if use_hint else [],
                 U, V, TAU * ETA, DELTA,
-                p_list,
                 use_hint
             )
     print(f"  collected {bp.trace_count()} traces  [{time.perf_counter()-t_start:.1f}s]")
